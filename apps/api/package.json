@@ -7,10 +7,11 @@
     "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run",
+    "test": "vitest run --exclude \"test/db/**\"",
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "fastify": "5.12.8"
+    "fastify": "5.12.8",
+    "pg": "8.23.1"
   }
 }

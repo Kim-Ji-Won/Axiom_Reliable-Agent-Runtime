@@ -14,10 +14,17 @@
     "typecheck": "npm run typecheck --workspace=@axiom/api",
     "build": "npm run build --workspace=@axiom/api",
     "test": "npm run test --workspace=@axiom/api",
-    "start": "npm run start --workspace=@axiom/api"
+    "start": "npm run start --workspace=@axiom/api",
+    "db:up": "docker compose up -d --wait",
+    "db:stop": "docker compose stop",
+    "db:migrate": "node --env-file-if-exists=.env --import tsx db/migrate-cli.ts dev",
+    "db:migrate:test": "node --env-file-if-exists=.env --import tsx db/migrate-cli.ts test",
+    "test:db": "node --env-file-if-exists=.env --import tsx node_modules/vitest/vitest.mjs run apps/api/test/db/runs.test.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "node-pg-migrate": "9.0.0",
     "tsx": "4.23.15",
     "typescript": "7.0.2",
     "vitest": "5.1.0"
