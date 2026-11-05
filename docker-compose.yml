@@ -1,0 +1,35 @@
+name: axiom
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: axiom
+      POSTGRES_USER: axiom
+      POSTGRES_PASSWORD: ${AXIOM_DB_PASSWORD:?Set AXIOM_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:56432:5432"
+    volumes:
+      - postgres_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axiom -d axiom"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  postgres-test:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: axiom_test
+      POSTGRES_USER: axiom_test
+      POSTGRES_PASSWORD: ${AXIOM_TEST_DB_PASSWORD:?Set AXIOM_TEST_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:56433:5432"
+    volumes:
+      - postgres_test:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axiom_test -d axiom_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  postgres_dev:
+  postgres_test:

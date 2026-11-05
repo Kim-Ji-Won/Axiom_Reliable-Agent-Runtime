@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P0-A1 — Backend Foundation 완료.** TypeScript 워크스페이스, Fastify API, 자동 테스트와 기본 실행 검증을 갖추었습니다. 에이전트 실행 루프와 데이터 영속성은 아직 구현하지 않았습니다.
+**현재 단계: P0-A2 — PostgreSQL Run Persistence Foundation 구현 및 검토 단계.** P0-A1 API 기반에 Run 저장·조회와 실제 PostgreSQL 통합 테스트를 추가했습니다. Run HTTP API와 에이전트 실행 루프는 아직 구현하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 API 기반에 한정됩니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 API 기반과 Run persistence에 한정됩니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -48,7 +48,7 @@ P0-A1에서 구현하고 검증한 범위는 다음과 같습니다.
 
 `/health`는 **API liveness**만 나타냅니다. 데이터베이스 readiness나 외부 의존성의 정상 동작을 확인하지 않습니다.
 
-PostgreSQL, Run API, 모델 호출, 도구 실행, 워커, 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
+P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. Run API, 모델 호출, 도구 실행, 워커, 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
 
 ## Architecture · 프로젝트 구조
 
@@ -59,12 +59,18 @@ Axiom/
 ├── apps/api/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성과 health route
-│   │   └── server.ts           # 서버 기동과 프로세스 종료
+│   │   ├── server.ts           # 서버 기동과 프로세스 종료
+│   │   └── persistence/        # DB pool 및 Run repository
 │   ├── test/
-│   │   └── health.test.ts      # liveness 및 미등록 경로 테스트
+│   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
+│   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
+│   │   └── db/                # 실제 PostgreSQL 통합 테스트
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
+├── db/                        # 마이그레이션 실행기와 migrations/
+├── docker-compose.yml
+├── .env.example
 ├── .gitignore
 ├── .npmrc
 ├── .nvmrc
@@ -102,7 +108,7 @@ npm run build
 npm start
 ```
 
-서버 주소는 `http://127.0.0.1:3000`이며, 해당 포트가 비어 있어야 합니다. 환경 변수나 `.env` 파일은 필요하지 않습니다. `npm start`는 컴파일된 결과를 실행하므로 먼저 빌드해야 합니다.
+서버 주소는 `http://127.0.0.1:3000`이며, 해당 포트가 비어 있어야 합니다. health API만 실행할 때는 DB 환경 변수나 `.env` 파일이 필요하지 않습니다. `npm start`는 컴파일된 결과를 실행하므로 먼저 빌드해야 합니다.
 
 별도 터미널에서 응답을 확인합니다.
 
@@ -126,29 +132,83 @@ npm run dev
 
 `tsx watch`를 사용해 소스 변경 시 서버를 다시 시작합니다. watch mode의 실제 재시작 동작은 baseline 검증 범위에 포함되지 않았습니다.
 
+## PostgreSQL · 로컬 저장 환경
+
+Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하지 않으며 Compose는 PostgreSQL만 실행합니다.
+
+```sh
+cp .env.example .env
+# .env의 두 비밀번호와 각 URL의 비밀번호를 같은 값으로 교체합니다.
+npm run db:up
+npm run db:migrate
+npm run db:migrate:test
+npm run test:db
+```
+
+이미 `.env`가 있다면 복사로 덮어쓰지 마세요. `.env`는 Git에서 제외됩니다. URL의 비밀번호에 특수문자가 포함되면 URL encoding이 필요합니다. Node의 `--env-file-if-exists`를 사용하므로 dotenv는 설치하지 않습니다. 명시적으로 export한 환경 변수가 `.env`보다 우선합니다.
+
+| 환경 | DB / 사용자 | 호스트 접속 | Compose 볼륨 |
+| --- | --- | --- | --- |
+| 개발 | `axiom` | `127.0.0.1:56432` | `postgres_dev` |
+| 테스트 | `axiom_test` | `127.0.0.1:56433` | `postgres_test` |
+
+두 환경은 별도 컨테이너·클러스터·볼륨·비밀번호를 사용합니다. 이미지 태그는 `postgres:17-alpine`으로 major를 고정하고 patch 갱신을 허용합니다. 비밀번호 환경 변수는 빈 볼륨의 최초 초기화에 적용되므로 기존 볼륨의 비밀번호는 `.env` 수정만으로 바뀌지 않습니다.
+
+- `AXIOM_DB_PASSWORD`, `AXIOM_TEST_DB_PASSWORD`: Compose 초기화용 비밀번호.
+- `DATABASE_URL`, `TEST_DATABASE_URL`: Node DB 연결 및 migration/test 대상. 코드에 연결 문자열을 하드코딩하지 않습니다.
+- migration/test 도구는 로컬 호스트·정확한 DB명과 사용자·URL 옵션 부재를 검증하고, 연결 후 실제 DB와 사용자도 확인합니다. 테스트는 개발 URL로 fallback하지 않습니다.
+- `npm run db:stop`은 컨테이너를 정지하고 데이터를 유지합니다. 볼륨 삭제는 데이터를 제거하므로 일반 실행·테스트 절차에 포함하지 않습니다.
+
+### Schema & Repository
+
+| 컬럼 | 정의 |
+| --- | --- |
+| `id` | UUID primary key; Node `crypto.randomUUID()`로 생성 |
+| `task` | top-level user task; 원문 유지, 1~4000 Unicode code points, trim 결과가 비어 있으면 거부 |
+| `status` | TEXT, 기본값 `queued`, CHECK로 `queued`만 허용 |
+| `created_at` | TIMESTAMPTZ, DB의 `NOW()` 기본값 |
+
+애플리케이션은 잘못된 타입·빈 값·공백 전용 값·길이 초과·NUL·잘못된 Unicode 문자열을 거부합니다. DB는 NOT NULL, 길이, JavaScript trim 공백 집합에 해당하는 nonblank CHECK, status CHECK 및 UUID/PK 제약을 독립적으로 강제합니다. emoji도 PostgreSQL `char_length`와 동일하게 code point 단위로 셉니다. 사용자 입력의 양끝 공백은 저장 전에 제거하지 않습니다.
+
+`createRunRepository(db)`는 `createRun(task): Promise<Run>`과 `findRunById(id): Promise<Run | null>`을 제공합니다. 반환값은 `{ id, task, status: 'queued', createdAt: Date }`입니다. status는 호출자가 지정할 수 없고, 조회 시에도 `queued` 여부를 확인합니다. 오류는 숨기지 않고 호출자에게 전달하며 DB 오류나 task 내용을 그대로 로그에 남기지 않습니다.
+
+각 생성은 parameterized INSERT 한 문장이므로 DB의 단일 문장 원자성을 사용합니다. `createDatabase(url)`로 만든 pool의 종료 책임은 호출자에게 있습니다. `withDatabase(url, work)`는 성공·실패 모두 `finally`에서 pool을 종료합니다. 현재 HTTP 서버는 DB pool을 생성하지 않아 DB가 꺼져도 `/health`는 정상 동작합니다.
+
+### Migrations & Test Isolation
+
+`db/migrations/1793883600000-create-runs.cjs`는 timestamp-prefix 이름의 첫 migration입니다. `node-pg-migrate`가 `pgmigrations`에 이력을 기록하며, 재실행 시 이미 적용한 migration을 건너뜁니다. 실행기는 advisory lock과 단일 transaction을 사용합니다.
+
+`npm run test:db`는 DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
+
+rollback은 테이블 데이터를 삭제하므로 제공된 실행기에서는 임시 테스트 스키마에만 허용합니다. 개발 DB 초기화나 자동 rollback 명령은 제공하지 않습니다. SQL migration 자체의 `down`은 파괴적이므로 별도 도구로 직접 실행할 때 주의해야 합니다.
+
+DB 저장·조회는 durable execution이나 crash recovery를 의미하지 않습니다. 해당 실행 의미와 검증은 P3 범위입니다.
+
 ## Validation · 검증
 
 ```sh
 npm run typecheck
 npm run build
 npm test
+npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 ```
 
 | 명령 | 확인 대상 |
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | 서버 소스의 JavaScript 빌드 |
-| `npm test` | `/health`의 응답 코드·본문 및 미등록 경로의 404 응답 |
+| `npm test` | health regression, task 입력 및 DB 대상 검증 (DB 불필요) |
+| `npm run test:db` | 실제 PostgreSQL migration, repository, constraint, 프로세스 간 영속성 |
 
-테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 종료 신호 검증은 자동 테스트와 별도로 수행했습니다.
+health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 종료 신호 검증은 자동 테스트와 별도로 수행했습니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1 이후 항목은 아직 구현하지 않았으며, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A2는 구현 후 검토 단계이며 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
-| P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1 완료; A2 이후 예정 |
+| P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1 완료; A2 구현·검토 중; A3 이후 예정 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
@@ -156,7 +216,9 @@ npm test
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
 
-현재 런타임 의존성은 Fastify입니다. PostgreSQL은 다음 저장 단계에서 도입할 예정이며, Redis·큐 등 추가 인프라는 구체적인 요구가 생겼을 때 검토합니다.
+현재 런타임 의존성은 Fastify와 pg이며, migration에는 개발 의존성인 node-pg-migrate를 사용합니다. Redis·큐 등 추가 인프라는 구체적인 요구가 생겼을 때 검토합니다.
+
+A2 설치 시 npm audit은 node-pg-migrate → glob/minimatch 개발 의존성 경로에 moderate 경고 3건을 보고했습니다. 자동 강제 다운그레이드나 호환성 미검증 override는 적용하지 않았습니다. 현재 migration 경로는 로컬 고정 경로이며 외부 glob 패턴을 받지 않습니다. 후속 patch 및 의존성 업데이트를 검토해야 합니다.
 
 ## Development Workflow · 개발 방식
 
