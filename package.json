@@ -1,0 +1,25 @@
+{
+  "name": "axiom",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.21.0 <23"
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace=@axiom/api",
+    "typecheck": "npm run typecheck --workspace=@axiom/api",
+    "build": "npm run build --workspace=@axiom/api",
+    "test": "npm run test --workspace=@axiom/api",
+    "start": "npm run start --workspace=@axiom/api"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}

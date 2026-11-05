@@ -1,0 +1,28 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+
+# Secrets: only sanitized examples may be shared.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# Local runtime, database, and editor artifacts.
+tmp/
+temp/
+*.pid
+*.pid.lock
+.pgdata/
+pgdata/
+.vscode/
+.idea/
+*.swp
+*.swo
