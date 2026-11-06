@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P0-A2 — PostgreSQL Run Persistence Foundation 구현 및 검토 단계.** P0-A1 API 기반에 Run 저장·조회와 실제 PostgreSQL 통합 테스트를 추가했습니다. Run HTTP API와 에이전트 실행 루프는 아직 구현하지 않았습니다.
+**현재 단계: P0-A3 — Run HTTP API 구현 및 검토 단계.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 에이전트 실행 루프는 아직 구현하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 API 기반과 Run persistence에 한정됩니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API와 PostgreSQL persistence에 한정됩니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -48,7 +48,7 @@ P0-A1에서 구현하고 검증한 범위는 다음과 같습니다.
 
 `/health`는 **API liveness**만 나타냅니다. 데이터베이스 readiness나 외부 의존성의 정상 동작을 확인하지 않습니다.
 
-P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. Run API, 모델 호출, 도구 실행, 워커, 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
+P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. P0-A3에서는 Run 생성·조회 API를 추가했습니다. 모델 호출, 도구 실행, 워커, 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
 
 ## Architecture · 프로젝트 구조
 
@@ -172,7 +172,7 @@ npm run test:db
 
 `createRunRepository(db)`는 `createRun(task): Promise<Run>`과 `findRunById(id): Promise<Run | null>`을 제공합니다. 반환값은 `{ id, task, status: 'queued', createdAt: Date }`입니다. status는 호출자가 지정할 수 없고, 조회 시에도 `queued` 여부를 확인합니다. 오류는 숨기지 않고 호출자에게 전달하며 DB 오류나 task 내용을 그대로 로그에 남기지 않습니다.
 
-각 생성은 parameterized INSERT 한 문장이므로 DB의 단일 문장 원자성을 사용합니다. `createDatabase(url)`로 만든 pool의 종료 책임은 호출자에게 있습니다. `withDatabase(url, work)`는 성공·실패 모두 `finally`에서 pool을 종료합니다. 현재 HTTP 서버는 DB pool을 생성하지 않아 DB가 꺼져도 `/health`는 정상 동작합니다.
+각 생성은 parameterized INSERT 한 문장이므로 DB의 단일 문장 원자성을 사용합니다. `createDatabase(url)`로 만든 pool의 종료 책임은 호출자에게 있습니다. `withDatabase(url, work)`는 성공·실패 모두 `finally`에서 pool을 종료합니다. HTTP 앱은 DB 설정이 있으면 pool 하나를 소유하고 요청 간 재사용하며 `app.close()`에서 종료합니다. 연결은 요청 시 시작하므로 DB가 꺼져도 `/health`는 정상 동작합니다.
 
 ### Migrations & Test Isolation
 
@@ -183,6 +183,26 @@ npm run test:db
 rollback은 테이블 데이터를 삭제하므로 제공된 실행기에서는 임시 테스트 스키마에만 허용합니다. 개발 DB 초기화나 자동 rollback 명령은 제공하지 않습니다. SQL migration 자체의 `down`은 파괴적이므로 별도 도구로 직접 실행할 때 주의해야 합니다.
 
 DB 저장·조회는 durable execution이나 crash recovery를 의미하지 않습니다. 해당 실행 의미와 검증은 P3 범위입니다.
+
+## Run HTTP API · 생성과 조회
+
+루트에서 `npm run build` 후 `npm start`를 실행합니다. `npm start`는 저장소 루트의 `.env`를 읽으며, 기존 환경 변수가 우선합니다. `packages/contracts`의 Zod 스키마와 타입은 workspace 패키지로 공유하고 빌드 시 JavaScript 및 타입 선언을 생성합니다.
+
+```sh
+curl -i http://127.0.0.1:3000/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"task":"회의록 정리"}'
+# 201 응답의 id로 조회
+curl -i "http://127.0.0.1:3000/runs/<id>"
+```
+
+POST는 `task` 하나만 허용하며 원문의 양끝 공백을 유지합니다. 생성은 `201`, 조회는 `200`이고 동일한 네 필드 계약을 사용합니다. 응답 예시:
+
+```json
+{"id":"12345678-1234-4234-8234-123456789abc","task":"회의록 정리","status":"queued","createdAt":"2026-11-06T00:00:00.000Z"}
+```
+
+`createdAt`은 DB 시각을 UTC ISO 8601로 직렬화합니다. 잘못된 입력·UUID·JSON은 `400 INVALID_REQUEST`, 미존재 UUID는 `404 RUN_NOT_FOUND`, DB 미설정·연결 장애는 `503 DATABASE_UNAVAILABLE`, 내부 오류는 `500 INTERNAL_ERROR`입니다. 오류 형식은 `{"error":{"code":"INVALID_REQUEST","message":"Invalid request"}}`입니다. 본문 크기 제한(`413`)과 미지원 미디어 타입(`415`)도 상태 코드를 유지합니다. 오류 응답과 요청 오류 로그에 입력 원문이나 DB 상세 정보를 포함하지 않습니다.
 
 ## Validation · 검증
 
@@ -196,19 +216,19 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | 명령 | 확인 대상 |
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
-| `npm run build` | 서버 소스의 JavaScript 빌드 |
-| `npm test` | health regression, task 입력 및 DB 대상 검증 (DB 불필요) |
-| `npm run test:db` | 실제 PostgreSQL migration, repository, constraint, 프로세스 간 영속성 |
+| `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
+| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력 및 DB 대상 검증 (DB 불필요) |
+| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, 프로세스 간 영속성 |
 
 health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 종료 신호 검증은 자동 테스트와 별도로 수행했습니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A2는 구현 후 검토 단계이며 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A2는 완료됐으며 P0-A3는 구현 후 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
-| P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1 완료; A2 구현·검토 중; A3 이후 예정 |
+| P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1·A2 완료; A3 구현·검토 중 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
@@ -216,7 +236,7 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
 
-현재 런타임 의존성은 Fastify와 pg이며, migration에는 개발 의존성인 node-pg-migrate를 사용합니다. Redis·큐 등 추가 인프라는 구체적인 요구가 생겼을 때 검토합니다.
+현재 런타임 의존성은 Fastify, pg와 Zod이며, migration에는 개발 의존성인 node-pg-migrate를 사용합니다. Redis·큐 등 추가 인프라는 구체적인 요구가 생겼을 때 검토합니다.
 
 A2 설치 시 npm audit은 node-pg-migrate → glob/minimatch 개발 의존성 경로에 moderate 경고 3건을 보고했습니다. 자동 강제 다운그레이드나 호환성 미검증 override는 적용하지 않았습니다. 현재 migration 경로는 로컬 고정 경로이며 외부 glob 패턴을 받지 않습니다. 후속 patch 및 의존성 업데이트를 검토해야 합니다.
 

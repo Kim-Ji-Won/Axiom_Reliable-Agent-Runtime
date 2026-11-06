@@ -1,6 +1,6 @@
 import { buildApp } from './app.js';
 
-const app = buildApp();
+const app = buildApp(process.env.DATABASE_URL ? { databaseUrl: process.env.DATABASE_URL } : {});
 let shuttingDown = false;
 
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
@@ -11,8 +11,8 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
   try {
     await app.close();
     app.log.info('Server closed');
-  } catch (error) {
-    app.log.error(error, 'Shutdown failed');
+  } catch {
+    app.log.error('Shutdown failed');
     process.exitCode = 1;
   }
 }
@@ -22,8 +22,8 @@ process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
 
 try {
   await app.listen({ host: '127.0.0.1', port: 3000 });
-} catch (error) {
-  app.log.error(error, 'Startup failed');
+} catch {
+  app.log.error('Startup failed');
   process.exitCode = 1;
   await app.close();
 }
