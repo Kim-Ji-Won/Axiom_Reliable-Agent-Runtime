@@ -1,3 +1,4 @@
+import { buildApp } from '../../src/app.js';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -60,6 +61,24 @@ describe('real PostgreSQL persistence', () => {
     await expect(repo.findRunById('invalid')).rejects.toThrow('UUID');
   });
 
+  it('POST then GET returns identical four fields backed by PostgreSQL', async () => {
+    const app = buildApp({ repository: createRunRepository(client), logger: false });
+    try {
+      const task = '  회의록 정리 😀  ';
+      const post = await app.inject({ method: 'POST', url: '/runs', payload: { task } });
+      expect(post.statusCode).toBe(201);
+      const run = post.json();
+      expect(Object.keys(run).sort()).toEqual(['createdAt', 'id', 'status', 'task']);
+      expect(run.task).toBe(task);
+      expect(run.status).toBe('queued');
+      const get = await app.inject(`/runs/${run.id}`);
+      expect(get.statusCode).toBe(200);
+      expect(get.json()).toEqual(run);
+      const stored = await createRunRepository(client).findRunById(run.id);
+      expect(run.createdAt).toBe(stored!.createdAt.toISOString());
+    } finally { await app.close(); }
+  });
+
   it('enforces repository validation before storing a run', async () => {
     const before = (await client.query('SELECT count(*) FROM runs')).rows[0].count;
     await expect(createRunRepository(client).createRun(' \n')).rejects.toThrow();
@@ -114,6 +133,18 @@ describe('real PostgreSQL persistence', () => {
       throw new Error('intentional callback failure');
     })).rejects.toThrow('intentional callback failure');
     await expect(captured!.query('SELECT 1')).rejects.toThrow();
+  });
+
+  it('app.close ends its real owned PostgreSQL pool', async () => {
+    const owned = createDatabase(readDatabaseUrl('test'));
+    const app = buildApp({ databaseUrl: readDatabaseUrl('test'), databaseFactory: () => owned, logger: false });
+    try {
+      await owned.query('SELECT 1');
+      expect(owned.totalCount).toBe(1);
+      await app.close();
+      await expect(owned.query('SELECT 1')).rejects.toThrow();
+      expect(owned.totalCount).toBe(0);
+    } finally { await app.close(); }
   });
 
   it('fails closed when the actual database identity is wrong', async () => {

@@ -1,3 +1,5 @@
+import { InvalidRunInputError, validateTask, runIdSchema } from '@axiom/contracts';
+export { InvalidRunInputError, validateTask } from '@axiom/contracts';
 import { randomUUID } from 'node:crypto';
 import type { Pool, QueryResultRow } from 'pg';
 
@@ -13,20 +15,6 @@ interface RunRow extends QueryResultRow {
   task: string;
   status: string;
   created_at: Date;
-}
-
-export class InvalidRunInputError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'InvalidRunInputError';
-  }
-}
-
-export function validateTask(task: unknown): asserts task is string {
-  if (typeof task !== 'string' || task.trim().length === 0 ||
-      [...task].length > 4000 || task.includes('\0') || /[\uD800-\uDFFF]/u.test(task)) {
-    throw new InvalidRunInputError('Task must contain non-whitespace text and at most 4000 Unicode code points');
-  }
 }
 
 function toRun(row: RunRow): Run {
@@ -49,7 +37,7 @@ export function createRunRepository(db: Pick<Pool, 'query'>) {
       return toRun(row);
     },
     async findRunById(id: string): Promise<Run | null> {
-      if (typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      if (!runIdSchema.safeParse(id).success) {
         throw new InvalidRunInputError('Run ID must be a UUID');
       }
       const result = await db.query<RunRow>(

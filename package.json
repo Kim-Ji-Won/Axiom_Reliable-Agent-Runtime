@@ -4,22 +4,27 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "apps/*"
+    "apps/*",
+    "packages/*"
   ],
   "engines": {
     "node": ">=22.21.0 <23"
   },
   "scripts": {
     "dev": "npm run dev --workspace=@axiom/api",
-    "typecheck": "npm run typecheck --workspace=@axiom/api",
-    "build": "npm run build --workspace=@axiom/api",
+    "typecheck": "npm run build:contracts && npm run typecheck --workspace=@axiom/api",
+    "build": "npm run build:contracts && npm run build --workspace=@axiom/api",
     "test": "npm run test --workspace=@axiom/api",
-    "start": "npm run start --workspace=@axiom/api",
+    "start": "node --env-file-if-exists=.env apps/api/dist/server.js",
     "db:up": "docker compose up -d --wait",
     "db:stop": "docker compose stop",
     "db:migrate": "node --env-file-if-exists=.env --import tsx db/migrate-cli.ts dev",
     "db:migrate:test": "node --env-file-if-exists=.env --import tsx db/migrate-cli.ts test",
-    "test:db": "node --env-file-if-exists=.env --import tsx node_modules/vitest/vitest.mjs run apps/api/test/db/runs.test.ts"
+    "test:db": "node --env-file-if-exists=.env --import tsx node_modules/vitest/vitest.mjs run apps/api/test/db/runs.test.ts",
+    "build:contracts": "npm run build --workspace=@axiom/contracts",
+    "pretest": "npm run build:contracts",
+    "pretest:db": "npm run build:contracts",
+    "predev": "npm run build:contracts"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
