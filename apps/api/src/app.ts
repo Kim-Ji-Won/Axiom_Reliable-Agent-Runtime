@@ -1,5 +1,5 @@
 import Fastify, { LogController } from 'fastify';
-import type { FastifyInstance, FastifyServerOptions } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyServerOptions } from 'fastify';
 import { createRunRequestSchema, runIdSchema, runResponseSchema } from '@axiom/contracts';
 import { createDatabase } from './persistence/database.js';
 import { createRunRepository } from './persistence/run-repository.js';
@@ -26,7 +26,21 @@ function databaseUnavailable(error: unknown): boolean {
 
 export function buildApp(options: AppOptions = {}): FastifyInstance {
   // Automatic request logging includes user-controlled URLs. Log only safe codes below.
-  const app = Fastify({ logger: options.logger ?? true, logController: new LogController({ disableRequestLogging: true }) });
+  const app = Fastify({
+    logger: options.logger ?? true,
+    logController: new LogController({ disableRequestLogging: true }),
+    // Router failures bypass setErrorHandler; never echo their path or raw error.
+    frameworkErrors(error, _request, reply: FastifyReply) {
+      if (error.code === 'FST_ERR_BAD_URL' || error.code === 'FST_ERR_MAX_PARAM_LENGTH') {
+        return reply.code(error.code === 'FST_ERR_BAD_URL' ? 400 : 414).send({
+          error: { code: 'INVALID_REQUEST', message: 'Invalid request' },
+        });
+      }
+      return reply.code(500).send({
+        error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
+      });
+    },
+  });
   let repository = options.repository;
   if (!repository && options.databaseUrl) {
     try {

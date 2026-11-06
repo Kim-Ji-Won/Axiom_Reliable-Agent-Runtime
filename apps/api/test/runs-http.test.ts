@@ -132,3 +132,19 @@ it('invalid DB configuration does not prevent startup or expose its value', asyn
   expect(response.statusCode).toBe(503);
   expect(response.body).not.toContain('invalid-secret');
 });
+
+it.each([
+  ['/runs/A3_SENTINEL%ZZ', 400],
+  [`/runs/${'A3_SENTINEL'.padEnd(101, 'x')}`, 414],
+])('sanitizes router-level error %s', async (url, status) => {
+  const logs: string[] = [];
+  const repository = { createRun: vi.fn(), findRunById: vi.fn() };
+  const app = buildApp({ repository, logger: { stream: { write: (line: string) => { logs.push(line); } } } });
+  apps.push(app);
+  const response = await app.inject({ method: 'GET', url });
+  expect.soft(response.statusCode).toBe(status);
+  expect.soft(response.json()).toEqual({ error: { code: 'INVALID_REQUEST', message: 'Invalid request' } });
+  expect.soft(logs.join('')).not.toContain('A3_SENTINEL');
+  expect.soft(repository.createRun).not.toHaveBeenCalled();
+  expect.soft(repository.findRunById).not.toHaveBeenCalled();
+});
