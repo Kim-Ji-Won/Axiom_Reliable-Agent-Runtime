@@ -1,12 +1,13 @@
 import { InvalidRunInputError, validateTask, runIdSchema } from '@axiom/contracts';
 export { InvalidRunInputError, validateTask } from '@axiom/contracts';
+import type { RunStatus } from '@axiom/contracts';
 import { randomUUID } from 'node:crypto';
 import type { Pool, QueryResultRow } from 'pg';
 
 export interface Run {
   id: string;
   task: string;
-  status: 'queued';
+  status: RunStatus;
   createdAt: Date;
 }
 
@@ -18,7 +19,7 @@ interface RunRow extends QueryResultRow {
 }
 
 function toRun(row: RunRow): Run {
-  if (row.status !== 'queued') throw new Error('Unexpected persisted run status');
+  if (row.status !== 'queued' && row.status !== 'running') throw new Error('Unexpected persisted run status');
   return { id: row.id, task: row.task, status: row.status, createdAt: row.created_at };
 }
 
@@ -35,6 +36,18 @@ export function createRunRepository(db: Pick<Pool, 'query'>) {
       const row = result.rows[0];
       if (!row) throw new Error('Run insert returned no row');
       return toRun(row);
+    },
+    async tryStartRun(id: string): Promise<Run | null> {
+      if (!runIdSchema.safeParse(id).success) {
+        throw new InvalidRunInputError('Run ID must be a UUID');
+      }
+      // PostgreSQL rechecks the predicate after waiting on a concurrent updater.
+      const result = await db.query<RunRow>(
+        `UPDATE runs SET status = 'running'
+         WHERE id = $1 AND status = 'queued'
+         RETURNING id, task, status, created_at`, [id],
+      );
+      return result.rows[0] ? toRun(result.rows[0]) : null;
     },
     async findRunById(id: string): Promise<Run | null> {
       if (!runIdSchema.safeParse(id).success) {

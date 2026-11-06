@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { validateTask, InvalidRunInputError } from '../src/persistence/run-repository.js';
+import { describe, expect, it, vi } from 'vitest';
+import { validateTask, InvalidRunInputError, createRunRepository } from '../src/persistence/run-repository.js';
 import { readDatabaseUrl } from '../../../db/connection.js';
 
 describe('persistence input boundaries', () => {
@@ -21,4 +21,10 @@ describe('persistence input boundaries', () => {
   it('does not fall back to the development URL', () => {
     expect(() => readDatabaseUrl('test', { DATABASE_URL: 'postgresql://axiom@localhost/axiom' })).toThrow('TEST_DATABASE_URL');
   });
+});
+
+it('rejects malformed start IDs before querying PostgreSQL', async () => {
+  const query = vi.fn();
+  await expect(createRunRepository({ query }).tryStartRun('bad-id')).rejects.toThrow(InvalidRunInputError);
+  expect(query).not.toHaveBeenCalled();
 });
