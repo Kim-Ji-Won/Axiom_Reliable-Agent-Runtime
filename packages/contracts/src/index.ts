@@ -20,10 +20,13 @@ export function validateTask(task: unknown): asserts task is string {
 
 export const runIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 export const createRunRequestSchema = z.strictObject({ task: taskSchema });
+export const runStatusSchema = z.enum(['queued', 'running']);
+export type RunStatus = z.infer<typeof runStatusSchema>;
+
 export const runResponseSchema = z.strictObject({
   id: runIdSchema,
   task: taskSchema,
-  status: z.literal('queued'),
+  status: runStatusSchema,
   createdAt: z.iso.datetime(),
 });
 export const errorResponseSchema = z.strictObject({

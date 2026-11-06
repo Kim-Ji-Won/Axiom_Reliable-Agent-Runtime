@@ -7,7 +7,7 @@ const run = { id, task: '  회의록 정리 😀  ', status: 'queued' as const, 
 const expected = { ...run, createdAt: run.createdAt.toISOString() };
 const apps: ReturnType<typeof buildApp>[] = [];
 function setup() {
-  const repository = { createRun: vi.fn().mockResolvedValue(run), findRunById: vi.fn().mockResolvedValue(run) };
+  const repository = { tryStartRun: vi.fn(), createRun: vi.fn().mockResolvedValue(run), findRunById: vi.fn().mockResolvedValue(run) };
   const app = buildApp({ repository, logger: false });
   apps.push(app);
   return { app, repository };
@@ -26,7 +26,7 @@ it('creates and reads the same four-field contract preserving raw task', async (
 });
 
 it.each([{}, { task: '' }, { task: ' \n\t' }, { task: 1 }, { task: null },
-  { task: 'ok', id }, { task: 'ok', status: 'queued' }, { task: 'ok', extra: true },
+  { task: 'ok', id }, { task: 'ok', status: 'queued' }, { task: 'ok', status: 'running' }, { task: 'ok', extra: true },
   { task: 'a'.repeat(4001) }, { task: '😀'.repeat(4001) }, { task: 'x\0y' },
   { task: '\ud800' }, { task: '\udc00' }, [], null])('rejects invalid body case %# before calling repository', async payload => {
   const { app, repository } = setup();
@@ -88,7 +88,7 @@ it('maps pool timeout and aggregate connection errors to 503', async () => {
 });
 it('sanitizes unexpected failures and invalid response contracts in responses and logs', async () => {
   const logs: string[] = [];
-  const repository = { createRun: vi.fn().mockRejectedValue(new Error('SECRET_URL SQL private_task')), findRunById: vi.fn().mockResolvedValue({ ...run, status: 'SECRET_STATUS' }) };
+  const repository = { tryStartRun: vi.fn(), createRun: vi.fn().mockRejectedValue(new Error('SECRET_URL SQL private_task')), findRunById: vi.fn().mockResolvedValue({ ...run, status: 'SECRET_STATUS' }) };
   const app = buildApp({ repository, logger: { stream: { write: (line: string) => { logs.push(line); } } } });
   apps.push(app);
   const post = await app.inject({ method: 'POST', url: '/runs', payload: { task: 'private_task' } });
@@ -138,7 +138,7 @@ it.each([
   [`/runs/${'A3_SENTINEL'.padEnd(101, 'x')}`, 414],
 ])('sanitizes router-level error %s', async (url, status) => {
   const logs: string[] = [];
-  const repository = { createRun: vi.fn(), findRunById: vi.fn() };
+  const repository = { tryStartRun: vi.fn(), createRun: vi.fn(), findRunById: vi.fn() };
   const app = buildApp({ repository, logger: { stream: { write: (line: string) => { logs.push(line); } } } });
   apps.push(app);
   const response = await app.inject({ method: 'GET', url });
@@ -147,4 +147,12 @@ it.each([
   expect.soft(logs.join('')).not.toContain('A3_SENTINEL');
   expect.soft(repository.createRun).not.toHaveBeenCalled();
   expect.soft(repository.findRunById).not.toHaveBeenCalled();
+});
+
+it('returns running through the existing GET contract', async () => {
+  const { app, repository } = setup();
+  repository.findRunById.mockResolvedValue({ ...run, status: 'running' });
+  const response = await app.inject(`/runs/${id}`);
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toEqual({ ...expected, status: 'running' });
 });
