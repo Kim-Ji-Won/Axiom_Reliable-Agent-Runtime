@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P0-A3 — Run HTTP API 구현 및 검토 단계.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 에이전트 실행 루프는 아직 구현하지 않았습니다.
+**현재 단계: P0-A4 — Test Baseline 구현 및 검토 단계. P0-A1~A3 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 에이전트 실행 루프는 아직 구현하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -34,7 +34,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 ## Current Status · 구현 현황
 
-P0-A1에서 구현하고 검증한 범위는 다음과 같습니다.
+현재 구현하고 검증한 범위는 다음과 같습니다.
 
 | 항목 | 현재 상태 |
 | --- | --- |
@@ -43,7 +43,7 @@ P0-A1에서 구현하고 검증한 범위는 다음과 같습니다.
 | Application | 포트를 열지 않는 `buildApp()` 구성 함수 |
 | Process lifecycle | 별도 서버 진입점, SIGINT·SIGTERM 종료 처리 |
 | Health endpoint | `GET /health` → `200 {"status":"ok"}` |
-| Automated tests | 포트를 열지 않는 Fastify injection 테스트 2개 |
+| Automated tests | HTTP 계약·오류·DB 안전장치 및 실제 PostgreSQL 통합 테스트 |
 | Baseline validation | 타입 검사, 빌드, 테스트, 실제 HTTP 요청 및 두 종료 신호 검증 완료 |
 
 `/health`는 **API liveness**만 나타냅니다. 데이터베이스 readiness나 외부 의존성의 정상 동작을 확인하지 않습니다.
@@ -58,16 +58,18 @@ P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repo
 Axiom/
 ├── apps/api/
 │   ├── src/
-│   │   ├── app.ts              # Fastify 앱 구성과 health route
+│   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
 │   │   └── persistence/        # DB pool 및 Run repository
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
-│   │   └── db/                # 실제 PostgreSQL 통합 테스트
+│   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
+│   │   └── db/                # runs.test.ts 및 process-fixture.ts; DB/HTTP 재시작 검증
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
+├── packages/contracts/        # 공유 Zod 스키마·타입, src/index.ts
 ├── db/                        # 마이그레이션 실행기와 migrations/
 ├── docker-compose.yml
 ├── .env.example
@@ -80,7 +82,7 @@ Axiom/
 └── README.md
 ```
 
-`app.ts`는 네트워크 포트를 열지 않으며, `server.ts`가 실제 listener를 시작합니다. 자동 테스트도 같은 앱 구성 함수를 사용합니다. 빌드 결과는 `apps/api/dist/`에 생성되며 테스트 파일과 생성 산출물은 각각 빌드 대상과 Git 추적 대상에서 제외됩니다.
+`app.ts`는 네트워크 포트를 열지 않으며, `server.ts`가 실제 listener를 시작합니다. 자동 테스트도 같은 앱 구성 함수를 사용합니다. 빌드 결과는 `apps/api/dist/`와 `packages/contracts/dist/`에 생성되며 테스트 파일과 생성 산출물은 각각 빌드 대상과 Git 추적 대상에서 제외됩니다.
 
 Runtime, Model, Tool 패키지는 해당 단계에서 실제 역할이 필요할 때 추가합니다.
 
@@ -90,6 +92,7 @@ Runtime, Model, Tool 패키지는 해당 단계에서 실제 역할이 필요할
 
 - **Node.js 22.21.0:** `.nvmrc`에 기록된 검증 버전입니다. 프로젝트의 허용 범위는 `>=22.21.0 <23`입니다.
 - **npm 10.9.4:** baseline 검증에 사용한 버전입니다.
+- **macOS의 Docker Desktop:** 앱을 시작하고 Docker Engine이 실행 중인지 확인합니다 (`docker info`).
 
 직접 의존성은 정확한 버전으로 지정하고, 전체 의존성 트리는 `package-lock.json`으로 기록합니다. `.npmrc`에서 engine 호환성을 검사합니다.
 
@@ -100,52 +103,72 @@ nvm install
 nvm use
 ```
 
-### Install & Run
+### Install, Test & Run · macOS 루트 실행 순서
+
+저장소 루트(예: `cd /Users/jiwon/Axiom`)에서 실행합니다. 다른 경로에 clone했다면 실제 저장소 경로로 이동하세요.
 
 ```sh
 npm ci
+# .env가 없는 경우에만 예시를 복사합니다.
+if [ ! -f .env ]; then cp .env.example .env; fi
+# 편집기로 .env의 두 비밀번호와 각 URL 비밀번호를 일치시켜 설정합니다.
+# 기존 .env와 기존 볼륨의 비밀번호는 그대로 유지합니다.
+npm run db:up
+npm run db:migrate:test
+npm run typecheck
 npm run build
+npm test
+npm run test:db
+```
+
+`test:db`는 `axiom_test`의 실행별 임시 schema에서 실제 HTTP 서버 A의 POST → 정상 종료 → 새 서버 B의 GET 일치를 검증합니다. 자동 테스트는 개발 DB에 쓰지 않으며 성공·실패 모두 자신의 schema와 연결을 정리합니다.
+
+수동 API 확인은 개발 DB를 사용합니다. 아래 migration은 기존 적용 이력을 유지합니다. POST로 만든 Run은 개발 DB에 남습니다.
+
+```sh
+npm run db:migrate
 npm start
 ```
 
-서버 주소는 `http://127.0.0.1:3000`이며, 해당 포트가 비어 있어야 합니다. health API만 실행할 때는 DB 환경 변수나 `.env` 파일이 필요하지 않습니다. `npm start`는 컴파일된 결과를 실행하므로 먼저 빌드해야 합니다.
+서버는 `http://127.0.0.1:3000`에서 실행하므로 포트가 비어 있어야 합니다. `npm start`는 빌드된 서버를 실행하고 **루트 `.env`를 읽습니다**. 셸에서 이미 전달한 환경 변수가 우선합니다. DB가 없어도 `/health`는 `200 {"status":"ok"}`이며 Run API는 `503`을 반환합니다.
 
-별도 터미널에서 응답을 확인합니다.
+별도 터미널에서 다음 순서로 생성·조회합니다. 첫 응답의 네 필드를 보관하고 ID를 그대로 사용하세요.
 
 ```sh
 curl --fail --include http://127.0.0.1:3000/health
+curl --fail --include http://127.0.0.1:3000/runs \
+  -H 'Content-Type: application/json' -d '{"task":"회의록 정리"}'
+# POST 201 응답의 실제 UUID로 교체
+RUN_ID='여기에-응답의-UUID'
+curl --fail --include "http://127.0.0.1:3000/runs/$RUN_ID"
 ```
 
-예상 응답은 HTTP `200`과 다음 JSON입니다.
+서버 터미널에서 **Ctrl-C(SIGINT)**로 종료하고 `Server closed`를 확인한 뒤, 같은 루트에서 다시 `npm start`를 실행합니다. 요청 터미널에서 위 GET을 다시 실행해 `200`과 최초 응답의 `id`, `task`, `status`, `createdAt` 네 값이 모두 같은지 확인합니다. SIGTERM으로도 정상 종료할 수 있습니다.
 
-```json
-{"status":"ok"}
+확인을 마치면 서버를 Ctrl-C로 종료하고 루트에서 DB를 정지합니다. 볼륨과 Run은 보존합니다.
+
+```sh
+npm run db:stop
 ```
-
-Ctrl-C(SIGINT) 또는 SIGTERM으로 서버를 정상 종료할 수 있습니다.
 
 ### Development
 
+현재 `npm run dev`는 `.env`를 자동으로 읽지 않습니다. Run API를 사용하려면 **실행 셸에 `DATABASE_URL`을 전달**해야 합니다. 비밀번호를 명령 이력에 직접 입력하지 않으려면 macOS zsh에서 다음과 같이 입력할 수 있습니다.
+
 ```sh
+read -rs 'DATABASE_URL?DATABASE_URL: '; echo
+export DATABASE_URL
 npm run dev
+# 종료 후 필요하다면 unset DATABASE_URL
 ```
 
-`tsx watch`를 사용해 소스 변경 시 서버를 다시 시작합니다. watch mode의 실제 재시작 동작은 baseline 검증 범위에 포함되지 않았습니다.
+`tsx watch`가 API 소스 변경을 감시합니다. contracts 소스를 수정했다면 `npm run build:contracts` 후 dev 서버를 다시 시작하세요. watch mode의 자동 재시작은 HTTP 프로세스 재시작 영속성 테스트와 별개이며 이번 검증 범위에 포함하지 않습니다.
 
 ## PostgreSQL · 로컬 저장 환경
 
 Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하지 않으며 Compose는 PostgreSQL만 실행합니다.
 
-```sh
-cp .env.example .env
-# .env의 두 비밀번호와 각 URL의 비밀번호를 같은 값으로 교체합니다.
-npm run db:up
-npm run db:migrate
-npm run db:migrate:test
-npm run test:db
-```
-
-이미 `.env`가 있다면 복사로 덮어쓰지 마세요. `.env`는 Git에서 제외됩니다. URL의 비밀번호에 특수문자가 포함되면 URL encoding이 필요합니다. Node의 `--env-file-if-exists`를 사용하므로 dotenv는 설치하지 않습니다. 명시적으로 export한 환경 변수가 `.env`보다 우선합니다.
+위 실행 순서에서 환경 파일 준비·DB 시작·migration·테스트를 수행합니다. `.env`는 Git에서 제외됩니다. URL 비밀번호에 특수문자가 포함되면 URL encoding이 필요합니다. Node의 `--env-file-if-exists`를 사용하는 start/migration/test:db 명령과, 셸 환경만 받는 dev 명령을 구분하세요.
 
 | 환경 | DB / 사용자 | 호스트 접속 | Compose 볼륨 |
 | --- | --- | --- | --- |
@@ -178,7 +201,7 @@ npm run test:db
 
 `db/migrations/1793883600000-create-runs.cjs`는 timestamp-prefix 이름의 첫 migration입니다. `node-pg-migrate`가 `pgmigrations`에 이력을 기록하며, 재실행 시 이미 적용한 migration을 건너뜁니다. 실행기는 advisory lock과 단일 transaction을 사용합니다.
 
-`npm run test:db`는 DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
+`npm run test:db`는 DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
 
 rollback은 테이블 데이터를 삭제하므로 제공된 실행기에서는 임시 테스트 스키마에만 허용합니다. 개발 DB 초기화나 자동 rollback 명령은 제공하지 않습니다. SQL migration 자체의 `down`은 파괴적이므로 별도 도구로 직접 실행할 때 주의해야 합니다.
 
@@ -218,17 +241,17 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
 | `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력 및 DB 대상 검증 (DB 불필요) |
-| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, 프로세스 간 영속성 |
+| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 프로세스 재시작 전후 HTTP 영속성 |
 
-health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 종료 신호 검증은 자동 테스트와 별도로 수행했습니다.
+health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 SIGINT/SIGTERM 종료 신호는 A3에서 별도로 검증했습니다. A4 DB 테스트는 서로 다른 프로세스가 실제 loopback 포트에서 HTTP를 처리하고 정상 종료하는 흐름을 추가합니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A2는 완료됐으며 P0-A3는 구현 후 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A3는 완료됐으며 P0-A4는 테스트·실행 문서 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
-| P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1·A2 완료; A3 구현·검토 중 |
+| P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A3 완료; A4 테스트·문서 검토 중 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |

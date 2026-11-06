@@ -94,6 +94,23 @@ describe('real PostgreSQL persistence', () => {
     expect(loaded.task).toBe('persist across separate processes');
   }, 30000);
 
+  it('preserves all four HTTP fields across a graceful API process restart', async () => {
+    const fixture = fileURLToPath(new URL('./process-fixture.ts', import.meta.url));
+    const options = { env: { ...process.env, TEST_SCHEMA: schema }, timeout: 15000 };
+    // exec resolves only after A closes its listener/client/pool and exits with code 0.
+    // A failed/timed-out child rejects; suite teardown still removes only our schema.
+    const before = JSON.parse((await exec(process.execPath, ['--import', 'tsx', fixture, 'http-create'], options)).stdout);
+    expect(before.status).toBe(201);
+    expect(Object.keys(before.run).sort()).toEqual(['createdAt', 'id', 'status', 'task']);
+    expect(before.run.task).toBe('  HTTP restart 회의록 😀  ');
+    expect(before.run.status).toBe('queued');
+    const after = JSON.parse((await exec(process.execPath, ['--import', 'tsx', fixture, 'http-read', before.run.id], options)).stdout);
+    expect(after.pid).not.toBe(before.pid);
+    expect(after.status).toBe(200);
+    expect(after.run).toEqual(before.run);
+    console.info('HTTP restart verified: POST 201 → process A exit 0 → process B GET 200; four fields equal');
+  }, 35000);
+
   // Deliberately bypass repository validation to exercise PostgreSQL constraints.
   it.each([
     ['valid', 'running', '23514'],
