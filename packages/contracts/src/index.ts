@@ -37,3 +37,6 @@ export const errorResponseSchema = z.strictObject({
 export type CreateRunRequest = z.infer<typeof createRunRequestSchema>;
 export type RunResponse = z.infer<typeof runResponseSchema>;
 export type ErrorResponse = z.infer<typeof errorResponseSchema>;
+
+export { modelDecisionSchema, parseModelDecision, InvalidModelDecisionError } from './model-decision.js';
+export type { ModelDecision, JsonObject } from './model-decision.js';
