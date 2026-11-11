@@ -1,6 +1,6 @@
-import { InvalidRunInputError, validateTask, runIdSchema } from '@axiom/contracts';
+import { InvalidRunInputError, validateTask, runIdSchema, runOutcomeSchema, runStatusSchema } from '@axiom/contracts';
 export { InvalidRunInputError, validateTask } from '@axiom/contracts';
-import type { RunStatus } from '@axiom/contracts';
+import type { RunStatus, RunOutcome } from '@axiom/contracts';
 import { randomUUID } from 'node:crypto';
 import type { Pool, QueryResultRow } from 'pg';
 
@@ -19,8 +19,9 @@ interface RunRow extends QueryResultRow {
 }
 
 function toRun(row: RunRow): Run {
-  if (row.status !== 'queued' && row.status !== 'running') throw new Error('Unexpected persisted run status');
-  return { id: row.id, task: row.task, status: row.status, createdAt: row.created_at };
+  const status = runStatusSchema.safeParse(row.status);
+  if (!status.success) throw new Error('Unexpected persisted run status');
+  return { id: row.id, task: row.task, status: status.data, createdAt: row.created_at };
 }
 
 export function createRunRepository(db: Pick<Pool, 'query'>) {
@@ -46,6 +47,17 @@ export function createRunRepository(db: Pick<Pool, 'query'>) {
         `UPDATE runs SET status = 'running'
          WHERE id = $1 AND status = 'queued'
          RETURNING id, task, status, created_at`, [id],
+      );
+      return result.rows[0] ? toRun(result.rows[0]) : null;
+    },
+    async tryFinishRun(id: string, outcome: RunOutcome): Promise<Run | null> {
+      if (!runIdSchema.safeParse(id).success || !runOutcomeSchema.safeParse(outcome).success) {
+        throw new InvalidRunInputError('Invalid Run ID or outcome');
+      }
+      const result = await db.query<RunRow>(
+        `UPDATE runs SET status = $2
+         WHERE id = $1 AND status = 'running'
+         RETURNING id, task, status, created_at`, [id, outcome],
       );
       return result.rows[0] ? toRun(result.rows[0]) : null;
     },

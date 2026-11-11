@@ -28,3 +28,19 @@ it('rejects malformed start IDs before querying PostgreSQL', async () => {
   await expect(createRunRepository({ query }).tryStartRun('bad-id')).rejects.toThrow(InvalidRunInputError);
   expect(query).not.toHaveBeenCalled();
 });
+
+// Deliberately bypass TypeScript to verify the runtime boundary before any SQL.
+it.each([
+  ['bad-id', 'completed'], [null, 'failed'], [123, 'completed'],
+  ['12345678-1234-4234-8234-123456789abc', 'queued'],
+  ['12345678-1234-4234-8234-123456789abc', 'running'],
+  ['12345678-1234-4234-8234-123456789abc', null],
+  ['12345678-1234-4234-8234-123456789abc', 1],
+  ['12345678-1234-4234-8234-123456789abc', 'COMPLETED'],
+])('rejects invalid finish input %# without querying', async (id, outcome) => {
+  const query = vi.fn();
+  const repo = createRunRepository({ query });
+  await expect(repo.tryFinishRun(id as string, outcome as Parameters<typeof repo.tryFinishRun>[1]))
+    .rejects.toThrow(InvalidRunInputError);
+  expect(query).not.toHaveBeenCalled();
+});
