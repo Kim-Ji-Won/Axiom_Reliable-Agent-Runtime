@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P1-A — 내부 Run 시작 연산 구현 및 검토 단계. P0-A1~A4 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`로 `queued → running` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
+**현재 단계: P1-B — 내부 Run 종료 연산 구현 및 검토 단계. P0-A1~A4 및 P1-A 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence와 내부 시작 연산에 한정됩니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence와 내부 시작·종료 연산에 한정됩니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -188,12 +188,12 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 | --- | --- |
 | `id` | UUID primary key; Node `crypto.randomUUID()`로 생성 |
 | `task` | top-level user task; 원문 유지, 1~4000 Unicode code points, trim 결과가 비어 있으면 거부 |
-| `status` | TEXT, 기본값 `queued`, CHECK로 `queued`와 `running`만 허용 |
+| `status` | TEXT, 기본값 `queued`, CHECK로 `queued`, `running`, `completed`, `failed` 허용 |
 | `created_at` | TIMESTAMPTZ, DB의 `NOW()` 기본값 |
 
 애플리케이션은 잘못된 타입·빈 값·공백 전용 값·길이 초과·NUL·잘못된 Unicode 문자열을 거부합니다. DB는 NOT NULL, 길이, JavaScript trim 공백 집합에 해당하는 nonblank CHECK, status CHECK 및 UUID/PK 제약을 독립적으로 강제합니다. emoji도 PostgreSQL `char_length`와 동일하게 code point 단위로 셉니다. 사용자 입력의 양끝 공백은 저장 전에 제거하지 않습니다.
 
-`createRunRepository(db)`는 `createRun(task): Promise<Run>`, `findRunById(id): Promise<Run | null>`, 내부 연산 `tryStartRun(id): Promise<Run | null>`을 제공합니다. 반환값은 `{ id, task, status: 'queued' | 'running', createdAt: Date }`입니다. 생성은 항상 `queued`이고 호출자가 status를 지정할 수 없습니다. 조회는 두 상태를 모두 지원합니다. 오류는 숨기지 않고 호출자에게 전달하며 DB 오류나 task 내용을 그대로 로그에 남기지 않습니다.
+`createRunRepository(db)`는 `createRun(task): Promise<Run>`, `findRunById(id): Promise<Run | null>`, 내부 연산 `tryStartRun(id): Promise<Run | null>`과 `tryFinishRun(id, outcome): Promise<Run | null>`을 제공합니다. 반환값은 `{ id, task, status: 'queued' | 'running' | 'completed' | 'failed', createdAt: Date }`입니다. 생성은 항상 `queued`이고 호출자가 status를 지정할 수 없습니다. 조회는 네 상태를 모두 지원합니다. 오류는 숨기지 않고 호출자에게 전달하며 DB 오류나 task 내용을 그대로 로그에 남기지 않습니다.
 
 각 생성은 parameterized INSERT 한 문장이므로 DB의 단일 문장 원자성을 사용합니다. `createDatabase(url)`로 만든 pool의 종료 책임은 호출자에게 있습니다. `withDatabase(url, work)`는 성공·실패 모두 `finally`에서 pool을 종료합니다. HTTP 앱은 DB 설정이 있으면 pool 하나를 소유하고 요청 간 재사용하며 `app.close()`에서 종료합니다. 연결은 요청 시 시작하므로 DB가 꺼져도 `/health`는 정상 동작합니다.
 
@@ -201,7 +201,11 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 
 `tryStartRun(id)`는 `UPDATE runs SET status = 'running' WHERE id = $1 AND status = 'queued' RETURNING …` 한 문장으로 상태를 바꿉니다. 성공 시 갱신된 Run을 반환하며 `id`, `task`, `createdAt`은 유지합니다. 유효한 UUID가 없거나 이미 시작됐다면 `null`, 잘못된 UUID라면 기존 입력 오류를 반환합니다. 두 독립 연결의 동시 요청에서도 한쪽만 성공하도록 DB가 조건을 재확인합니다.
 
-시작 HTTP 엔드포인트는 없습니다. POST는 계속 `queued`로 생성하며 `status` 추가 필드를 거부합니다. 내부에서 시작한 Run은 기존 GET에서 `running`으로 확인할 수 있습니다. 모델 호출·worker·자동 실행·후속 상태 전이는 아직 구현하지 않았습니다.
+시작 HTTP 엔드포인트는 없습니다. POST는 계속 `queued`로 생성하며 `status` 추가 필드를 거부합니다. 내부에서 시작한 Run은 기존 GET에서 `running`으로 확인할 수 있습니다. 모델 호출·worker·자동 실행은 아직 구현하지 않았습니다.
+
+### Internal Finish · 내부 종료 연산
+
+`tryFinishRun(id, outcome)`은 `completed` 또는 `failed`만 허용합니다. UUID와 outcome을 SQL 전에 검증하고 `UPDATE runs SET status = $2 WHERE id = $1 AND status = 'running' RETURNING …` 한 문장으로 종료합니다. 성공하면 갱신된 Run, 미존재·queued·이미 종료된 Run이면 `null`을 반환합니다. 완료와 실패가 경합해도 한쪽만 성공하며 종료된 Run은 재시작하거나 재종료할 수 없습니다. 기존 GET은 종료 상태도 같은 네 필드로 반환하고 `id`, `task`, `createdAt`은 유지됩니다. 종료 HTTP 엔드포인트와 결과 본문·실패 사유 저장은 포함하지 않습니다.
 
 ### Migrations & Test Isolation
 
@@ -209,7 +213,9 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 
 기존 migration은 보존하고 `1793962800000-allow-running-runs.cjs`를 추가했습니다. 새 migration은 상태 CHECK만 확장하며 기존 행과 `queued` 기본값을 유지합니다. 기존 DB에서는 `npm run db:migrate`로 새 migration을 적용한 뒤 내부 시작 연산을 사용하세요. 이 migration의 down은 `running` 행이 하나라도 있으면 제약 검증에서 안전하게 실패하고 행·기존 제약·migration 이력을 유지합니다. 행을 `queued`로 되돌리거나 삭제하지 않습니다.
 
-`npm run test:db`는 DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, 독립 연결의 동시 시작·running GET·rollback 거부, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
+새 `1793966400000-allow-finished-runs.cjs`는 네 상태를 허용하며 기존 queued/running 행을 보존합니다. 이 migration의 down은 종료 행이 없을 때 queued/running 제약으로 돌아갑니다. completed 또는 failed 행이 있으면 데이터·현재 제약·migration 이력을 바꾸지 않고 실패합니다. 개발 DB에 자동 적용하지 않습니다.
+
+`npm run test:db`는 DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, 독립 연결의 동시 시작·동시 종료·최종 상태 GET·rollback 성공 및 거부, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
 
 첫 migration의 rollback은 테이블 데이터를 삭제하므로 제공된 실행기에서는 임시 테스트 스키마에만 허용합니다. 개발 DB 초기화나 자동 rollback 명령은 제공하지 않습니다. 첫 SQL migration 자체의 `down`은 파괴적이므로 별도 도구로 직접 실행할 때 주의해야 합니다.
 
@@ -255,12 +261,12 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4는 완료됐으며 P1-A는 내부 시작 연산 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A는 완료됐으며 P1-B는 내부 종료 연산 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
-| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A 내부 queued → running 구현·검토 중; 나머지 예정 |
+| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A 완료; P1-B running → completed/failed 구현·검토 중; 나머지 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |

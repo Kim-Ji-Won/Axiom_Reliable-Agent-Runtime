@@ -35,21 +35,30 @@ afterAll(async () => {
 });
 
 describe('real PostgreSQL persistence', () => {
-  it('migrates an empty schema, records history, is repeatable, and supports rollback', async () => {
-    expect(await migrate('test', 'up', schema)).toHaveLength(2);
+  it('migrates an empty schema, preserves old rows, restores prior constraints, and reapplies', async () => {
+    expect(await migrate('test', 'up', schema)).toHaveLength(3);
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(2);
-    expect(await migrate('test', 'down', schema)).toHaveLength(1);
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(1);
-    const old = (await client.query('INSERT INTO runs (id, task) VALUES ($1, $2) RETURNING *', [randomUUID(), 'existing queued run'])).rows[0];
-    expect(old.status).toBe('queued');
-    expect(await migrate('test', 'up', schema)).toHaveLength(1);
-    expect((await client.query('SELECT * FROM runs WHERE id=$1', [old.id])).rows[0]).toEqual(old);
-    expect(await migrate('test', 'down', schema)).toHaveLength(1);
-    expect(await migrate('test', 'down', schema)).toHaveLength(1);
+    for (let i = 0; i < 3; i++) expect(await migrate('test', 'down', schema)).toHaveLength(1);
     expect((await client.query("SELECT to_regclass('runs') AS name")).rows[0].name).toBeNull();
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(0);
-    expect(await migrate('test', 'up', schema)).toHaveLength(2);
+    expect(await migrate('test', 'up', schema)).toHaveLength(3);
+    expect(await migrate('test', 'down', schema)).toHaveLength(1);
+    const repo = createRunRepository(client);
+    const queued = await repo.createRun('old queued');
+    const running = await repo.createRun('old running');
+    await repo.tryStartRun(running.id);
+    const before = (await client.query('SELECT * FROM runs ORDER BY id')).rows;
+    expect(await migrate('test', 'up', schema)).toHaveLength(1);
+    expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
+    expect(await migrate('test', 'down', schema)).toHaveLength(1);
+    expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(2);
+    for (const status of ['completed', 'failed']) {
+      await expect(client.query('UPDATE runs SET status=$1 WHERE id=$2', [status, running.id]))
+        .rejects.toMatchObject({ code: '23514' });
+    }
+    expect(await repo.findRunById(queued.id)).toEqual(queued);
+    expect(await migrate('test', 'up', schema)).toHaveLength(1);
   });
 
   it('creates and reads a Run with DB time, preserving original text', async () => {
@@ -152,20 +161,107 @@ describe('real PostgreSQL persistence', () => {
     const repo = createRunRepository(client);
     const run = await repo.createRun('rollback safety');
     expect((await repo.tryStartRun(run.id))!.status).toBe('running');
+    expect(await migrate('test', 'down', schema)).toHaveLength(1);
     const before = (await client.query('SELECT * FROM runs ORDER BY id')).rows;
     const history = (await client.query('SELECT * FROM pgmigrations ORDER BY id')).rows;
     await expect(migrate('test', 'down', schema)).rejects.toThrow();
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
     expect((await client.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(history);
-    expect(await migrate('test', 'up', schema)).toHaveLength(0);
+    expect(await migrate('test', 'up', schema)).toHaveLength(1);
     const next = await repo.createRun('still queued by default');
     expect(next.status).toBe('queued');
     expect((await repo.tryStartRun(next.id))!.status).toBe('running');
   });
 
+  it.each(['completed', 'failed'] as const)('finishes %s once and preserves the HTTP fields', async outcome => {
+    const repo = createRunRepository(client);
+    const app = buildApp({ repository: repo, logger: false });
+    try {
+      const post = await app.inject({ method: 'POST', url: '/runs', payload: { task: '  finish 😀  ' } });
+      expect(post.statusCode).toBe(201);
+      const created = post.json();
+      expect(created.status).toBe('queued');
+      expect(await repo.tryFinishRun(created.id, outcome)).toBeNull();
+      expect((await app.inject(`/runs/${created.id}`)).json()).toEqual(created);
+      expect(await repo.tryFinishRun(randomUUID(), outcome)).toBeNull();
+      await repo.tryStartRun(created.id);
+      const finished = await repo.tryFinishRun(created.id, outcome);
+      expect(finished).toEqual({ ...created, status: outcome, createdAt: new Date(created.createdAt) });
+      expect(await repo.tryStartRun(created.id)).toBeNull();
+      for (const repeated of ['completed', 'failed'] as const) {
+        expect(await repo.tryFinishRun(created.id, repeated)).toBeNull();
+      }
+      const get = await app.inject(`/runs/${created.id}`);
+      expect(get.statusCode).toBe(200);
+      expect(get.json()).toEqual({ ...created, status: outcome });
+    } finally { await app.close(); }
+  });
+
+  it('resolves competing completion and failure on independent backends exactly once', async () => {
+    const repo = createRunRepository(client);
+    const created = await repo.createRun('  competing finish 😀  ');
+    await repo.tryStartRun(created.id);
+    const connections: PoolClient[] = [];
+    try {
+      for (let i = 0; i < 2; i++) {
+        const connection = await pool.connect();
+        connections.push(connection);
+        await assertDatabaseIdentity(connection, 'test');
+        await connection.query(`SET search_path TO "${schema}"`);
+      }
+      const [a, b] = connections as [PoolClient, PoolClient];
+      const pids = await Promise.all(connections.map(c => c.query('SELECT pg_backend_pid() AS pid')));
+      expect(pids[0]!.rows[0].pid).not.toBe(pids[1]!.rows[0].pid);
+      const results = await Promise.all([
+        createRunRepository(a).tryFinishRun(created.id, 'completed'),
+        createRunRepository(b).tryFinishRun(created.id, 'failed'),
+      ]);
+      expect(results.filter(run => run === null)).toHaveLength(1);
+      const winner = results.find(run => run !== null)!;
+      expect(winner.status).toBe(results[0] ? 'completed' : 'failed');
+      expect(winner).toEqual({ ...created, status: winner.status });
+      const app = buildApp({ repository: repo, logger: false });
+      try {
+        const get = await app.inject(`/runs/${created.id}`);
+        expect(get.statusCode).toBe(200);
+        expect(get.json()).toEqual({ ...created, status: winner.status, createdAt: created.createdAt.toISOString() });
+        console.info(JSON.stringify({ backendPids: pids.map(p => p.rows[0].pid), finishResults: results, getStatus: get.statusCode, get: get.json() }));
+      } finally { await app.close(); }
+    } finally { connections.forEach(c => c.release()); }
+  });
+
+  it.each(['completed', 'failed'] as const)('refuses rollback with only %s terminal rows and preserves constraints/history/data', async outcome => {
+    const isolated = `axiom_test_${randomUUID().replaceAll('-', '')}`;
+    const connection = await pool.connect();
+    let created = false;
+    try {
+      await assertDatabaseIdentity(connection, 'test');
+      await connection.query(`CREATE SCHEMA "${isolated}"`);
+      created = true;
+      await connection.query(`SET search_path TO "${isolated}"`);
+      await migrate('test', 'up', isolated);
+      const repo = createRunRepository(connection);
+      const run = await repo.createRun('rollback terminal safety');
+      await repo.tryStartRun(run.id);
+      await repo.tryFinishRun(run.id, outcome);
+      const rows = (await connection.query('SELECT * FROM runs ORDER BY id')).rows;
+      const history = (await connection.query('SELECT * FROM pgmigrations ORDER BY id')).rows;
+      const constraints = () => connection.query("SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid = 'runs'::regclass ORDER BY conname");
+      const beforeConstraints = (await constraints()).rows;
+      await expect(migrate('test', 'down', isolated)).rejects.toThrow();
+      expect((await connection.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(rows);
+      expect((await connection.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(history);
+      expect((await constraints()).rows).toEqual(beforeConstraints);
+      expect(await migrate('test', 'up', isolated)).toHaveLength(0);
+    } finally {
+      try { if (created) await connection.query(`DROP SCHEMA "${isolated}" CASCADE`); }
+      finally { connection.release(); }
+    }
+  });
+
   // Deliberately bypass repository validation to exercise PostgreSQL constraints.
   it.each([
-    ['valid', 'completed', '23514'],
+    ['valid', 'cancelled', '23514'],
     ['valid', null, '23502'],
     [null, 'queued', '23502'],
     ['', 'queued', '23514'],
