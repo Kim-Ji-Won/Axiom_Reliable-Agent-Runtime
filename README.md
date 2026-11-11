@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P1-B — 내부 Run 종료 연산 구현 및 검토 단계. P0-A1~A4 및 P1-A 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
+**현재 단계: P1-C — Model Decision Contract 구현 및 검토 단계. P0-A1~A4 및 P1-A·B 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -64,12 +64,13 @@ Axiom/
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
+│   │   ├── model-decision.test.ts # 모델 결정·JSON 안전성 및 경계 검증
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
 │   │   └── db/                # runs.test.ts 및 process-fixture.ts; DB/HTTP 재시작 검증
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
-├── packages/contracts/        # 공유 Zod 스키마·타입, src/index.ts
+├── packages/contracts/        # 공유 Zod 스키마·타입, src/index.ts 및 model-decision.ts
 ├── db/                        # 마이그레이션 실행기와 migrations/
 ├── docker-compose.yml
 ├── .env.example
@@ -207,6 +208,25 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 
 `tryFinishRun(id, outcome)`은 `completed` 또는 `failed`만 허용합니다. UUID와 outcome을 SQL 전에 검증하고 `UPDATE runs SET status = $2 WHERE id = $1 AND status = 'running' RETURNING …` 한 문장으로 종료합니다. 성공하면 갱신된 Run, 미존재·queued·이미 종료된 Run이면 `null`을 반환합니다. 완료와 실패가 경합해도 한쪽만 성공하며 종료된 Run은 재시작하거나 재종료할 수 없습니다. 기존 GET은 종료 상태도 같은 네 필드로 반환하고 `id`, `task`, `createdAt`은 유지됩니다. 종료 HTTP 엔드포인트와 결과 본문·실패 사유 저장은 포함하지 않습니다.
 
+### Model Decision Contract · 모델 결정 제안
+
+`@axiom/contracts`는 `modelDecisionSchema`, `parseModelDecision(raw: unknown)`, 공유 타입 `ModelDecision`·`JsonObject`를 제공합니다. 두 진입점 모두 동일한 안전성 검증을 수행합니다.
+
+```ts
+{ kind: 'final', content: '분석 결과입니다.' }
+{ kind: 'tool_request', toolName: 'search_documents', arguments: { query: 'PostgreSQL' } }
+```
+
+`final.content`는 원문을 보존하며 1~4000 Unicode code points, 비공백 텍스트만 허용합니다. NUL과 짝이 맞지 않는 surrogate를 거부합니다. `toolName`은 소문자로 시작하는 1~64자의 소문자·숫자·`_`·`-`입니다. 두 variant 모두 추가 필드와 암묵적 타입 변환을 거부합니다.
+
+`arguments`는 JSON 객체이며 루트 객체를 깊이 1로 세고 중첩 객체·배열은 최대 깊이 8까지 허용합니다. 공백 없는 `JSON.stringify(arguments)` 형식의 UTF-8 크기는 최대 8192 bytes입니다. 키·구분자·escape·반복 참조의 직렬화 크기도 포함합니다. 검증은 객체의 getter나 `toJSON`을 실행하지 않고 data property를 검사하며 문자열·유한 숫자·boolean·null·배열·객체를 보존합니다.
+
+Node.js의 `util.types.isProxy`로 Proxy를 탐지해 trap 실행 전에 거부합니다. 같은 realm의 plain object(Object.prototype 또는 null prototype)와 밀집 배열만 받으며 accessor·symbol key·숨겨진 속성·사용자 지정 prototype·비 JSON 객체·순환 참조를 거부합니다. 방문 깊이와 값/문자열 처리량은 제한하지만 `Reflect.ownKeys` 자체는 전달된 객체의 전체 키 목록을 생성합니다. 입력 객체의 생성 및 전송 크기 제한은 호출 경계에서도 적용해야 합니다. 현재 구현은 Node.js용이며 브라우저 지원은 검증하지 않았습니다.
+
+`parseModelDecision`은 실패 시 Run 입력 오류와 별개의 `InvalidModelDecisionError`를 던집니다. 스키마는 Zod 오류를 반환하며, 실패 입력은 오류 생성 전에 제거해 `reportInput` 옵션에서도 원문·인자·비밀정보가 담기지 않도록 합니다. 검증된 인자는 복사·freeze하지 않으므로 호출자는 검증 후 입력을 변경하지 않고 사용해야 합니다.
+
+**A model request is not execution authorization.** `tool_request`는 모델의 도구 요청 제안이며 실행 승인은 별도 Runtime 정책의 책임입니다. `final`도 최종 텍스트 제안입니다. P1-C는 결정 계약과 입력 검증까지 구현하며, 모델 호출·provider adapter·권한 정책·실제 도구 실행·Run 자동 전이·실행 루프는 후속 단계입니다.
+
 ### Migrations & Test Isolation
 
 `db/migrations/1793883600000-create-runs.cjs`는 timestamp-prefix 이름의 첫 migration입니다. `node-pg-migrate`가 `pgmigrations`에 이력을 기록하며, 재실행 시 이미 적용한 migration을 건너뜁니다. 실행기는 advisory lock과 단일 transaction을 사용합니다.
@@ -261,12 +281,12 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A는 완료됐으며 P1-B는 내부 종료 연산 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A·B는 완료됐으며 P1-C는 Model Decision Contract 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
-| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A 완료; P1-B running → completed/failed 구현·검토 중; 나머지 예정 |
+| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A·B 완료; P1-C Model Decision Contract 구현·검토 중; 나머지 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
