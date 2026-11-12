@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P1-C — Model Decision Contract 구현 및 검토 단계. P0-A1~A4 및 P1-A·B 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
+**현재 단계: P1-D — One-Shot Runtime 구현 브랜치에서 검토 중. P0-A1~A4 및 P1-A·B·C 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence와 내부 시작·종료 연산에 한정됩니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약과 내부 one-shot orchestration까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -60,10 +60,12 @@ Axiom/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
-│   │   └── persistence/        # DB pool 및 Run repository
+│   │   ├── persistence/        # DB pool 및 Run repository
+│   │   └── runtime/            # run-one-decision.ts; 내부 단일 결정 실행
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
+│   │   ├── runtime.test.ts     # claim·결정·종료 및 오류 경계
 │   │   ├── model-decision.test.ts # 모델 결정·JSON 안전성 및 경계 검증
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
 │   │   └── db/                # runs.test.ts 및 process-fixture.ts; DB/HTTP 재시작 검증
@@ -227,6 +229,29 @@ Node.js의 `util.types.isProxy`로 Proxy를 탐지해 trap 실행 전에 거부�
 
 **A model request is not execution authorization.** `tool_request`는 모델의 도구 요청 제안이며 실행 승인은 별도 Runtime 정책의 책임입니다. `final`도 최종 텍스트 제안입니다. P1-C는 결정 계약과 입력 검증까지 구현하며, 모델 호출·provider adapter·권한 정책·실제 도구 실행·Run 자동 전이·실행 루프는 후속 단계입니다.
 
+### One-Shot Runtime · 단일 결정 실행 (P1-D 검토 중)
+
+`apps/api/src/runtime/run-one-decision.ts`의 `runOneDecision(runId, { repository, decide })`는 기존 `tryStartRun`·`tryFinishRun`과 주입된 테스트용 `decide(run): Promise<unknown>`를 연결합니다. 실제 모델 호출이나 HTTP 호출 경로는 연결하지 않았습니다.
+
+```text
+queued → 원자적 claim → running → decide 1회 → parseModelDecision → 종료 시도
+```
+
+| 상황 | 종료 시도 | 반환 결과 |
+| --- | --- | --- |
+| 미존재·이미 running·종료 Run | 없음, decide 호출 없음 | `not_started` |
+| 유효한 final | completed | 종료 성공 시에만 `completed`와 원문 `content` |
+| 유효한 tool_request | failed | `unsupported_tool_request` |
+| 계약 위반 | failed | `invalid_decision` |
+| 결정 함수 throw/reject | failed | `decision_source_error` |
+| 어떤 종료 시도든 null 반환 | 추가 조회·재시도 없음 | `finalize_conflict` |
+
+**A model request is not execution authorization.** 도구 요청은 현재 초기 정책에 따라 failed로 종료하며 Tool Registry 조회·승인·실행은 수행하지 않습니다. `completed` 이외의 결과에는 모델 원문·도구 이름·인자·task·결정 함수 오류를 담지 않으며 Runtime은 이를 로그에 남기지 않습니다. 최종 텍스트는 호출자에게만 일시적으로 반환하고 DB나 HTTP 응답에 저장·추가하지 않습니다.
+
+잘못된 UUID와 시작·종료 DB 오류는 호출자에게 reject되며 정상 결과로 위장하지 않습니다. 호출자는 persistence 예외의 상세 내용을 그대로 로그나 외부 응답에 노출하지 않아야 합니다. Runtime은 pool을 만들거나 닫지 않으며 의존성을 제공한 호출자가 연결 수명을 관리합니다.
+
+이 기능은 in-process 한 번의 결정 시도입니다. 프로세스 중단이나 DB 오류로 Run이 running에 남을 수 있고 자동 복구하지 않습니다. exactly-once 실행, retry, timeout, cancellation, durable recovery, 여러 단계의 실행 루프를 보장하지 않습니다. `decide`는 신뢰하는 주입 코드이며 Runtime이 해당 함수의 부작용을 격리하지는 않습니다. P1-D는 아직 병합 전 검토 단계입니다.
+
 ### Migrations & Test Isolation
 
 `db/migrations/1793883600000-create-runs.cjs`는 timestamp-prefix 이름의 첫 migration입니다. `node-pg-migrate`가 `pgmigrations`에 이력을 기록하며, 재실행 시 이미 적용한 migration을 건너뜁니다. 실행기는 advisory lock과 단일 transaction을 사용합니다.
@@ -274,19 +299,19 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
-| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력 및 DB 대상 검증 (DB 불필요) |
-| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 프로세스 재시작 전후 HTTP 영속성 |
+| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot Runtime 검증 (DB 불필요) |
+| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 재시작 영속성, Runtime 동시 claim·종료 경합 |
 
 health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 SIGINT/SIGTERM 종료 신호는 A3에서 별도로 검증했습니다. A4 DB 테스트는 서로 다른 프로세스가 실제 loopback 포트에서 HTTP를 처리하고 정상 종료하는 흐름을 추가합니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A·B는 완료됐으며 P1-C는 Model Decision Contract 검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A·B·C는 완료됐으며 P1-D는 One-Shot Runtime 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
-| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A·B 완료; P1-C Model Decision Contract 구현·검토 중; 나머지 예정 |
+| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A·B·C 완료; P1-D One-Shot Runtime 구현·검토 중; 나머지 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |

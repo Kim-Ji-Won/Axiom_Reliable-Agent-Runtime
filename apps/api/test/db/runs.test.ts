@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { runOneDecision } from '../../src/runtime/run-one-decision.js';
 import type { Pool, PoolClient } from 'pg';
 import { createDatabase, withDatabase } from '../../src/persistence/database.js';
 import { createRunRepository } from '../../src/persistence/run-repository.js';
@@ -257,6 +258,97 @@ describe('real PostgreSQL persistence', () => {
       try { if (created) await connection.query(`DROP SCHEMA "${isolated}" CASCADE`); }
       finally { connection.release(); }
     }
+  });
+
+  it('orchestrates one decision across independent backends and exposes completed via GET', async () => {
+    const created = await createRunRepository(client).createRun('  one-shot runtime 😀  ');
+    const connections: PoolClient[] = [];
+    try {
+      for (let i = 0; i < 2; i++) {
+        const connection = await pool.connect();
+        connections.push(connection);
+        await assertDatabaseIdentity(connection, 'test');
+        await connection.query(`SET search_path TO "${schema}"`);
+        await connection.query("SET statement_timeout TO '5s'");
+      }
+      const pids = await Promise.all(connections.map(c => c.query('SELECT pg_backend_pid() AS pid')));
+      expect(pids[0]!.rows[0].pid).not.toBe(pids[1]!.rows[0].pid);
+      const content = '  temporary final 😀  ';
+      const deps = connections.map(connection => ({
+        repository: createRunRepository(connection),
+        decide: vi.fn(async () => ({ kind: 'final', content })),
+      }));
+      // Settle both requests before releasing either connection, even on failure.
+      const settled = await Promise.allSettled(deps.map(d => runOneDecision(created.id, d)));
+      expect(settled.every(result => result.status === 'fulfilled')).toBe(true);
+      const results = settled.map(result => result.status === 'fulfilled' ? result.value : null);
+      expect(results.filter(result => result?.kind === 'not_started')).toHaveLength(1);
+      expect(results.filter(result => result?.kind === 'completed')).toEqual([{ kind: 'completed', content }]);
+      expect(deps.reduce((count, d) => count + d.decide.mock.calls.length, 0)).toBe(1);
+      deps.forEach((d, index) => {
+        if (results[index]?.kind === 'completed') {
+          expect(d.decide).toHaveBeenCalledExactlyOnceWith({ ...created, status: 'running' });
+        } else expect(d.decide).not.toHaveBeenCalled();
+      });
+      const stored = { ...created, status: 'completed' };
+      expect(await createRunRepository(client).findRunById(created.id)).toEqual(stored);
+      const app = buildApp({ repository: createRunRepository(client), logger: false });
+      try {
+        const get = await app.inject(`/runs/${created.id}`);
+        expect(get.statusCode).toBe(200);
+        expect(get.json()).toEqual({ ...stored, createdAt: created.createdAt.toISOString() });
+        console.info(JSON.stringify({ runtimeBackendPids: pids.map(p => p.rows[0].pid), resultKinds: results.map(r => r?.kind), decisionCalls: 1, getStatus: get.statusCode, runStatus: get.json().status, fieldsPreserved: true }));
+      } finally { await app.close(); }
+    } finally { connections.forEach(connection => connection.release()); }
+  }, 15000);
+
+  it.each(['completed', 'failed'] as const)('reports finalize_conflict and preserves an external %s winner', async outcome => {
+    const repository = createRunRepository(client);
+    const created = await repository.createRun('finalization conflict');
+    const other = await pool.connect();
+    try {
+      await assertDatabaseIdentity(other, 'test');
+      await other.query(`SET search_path TO "${schema}"`);
+      await other.query("SET statement_timeout TO '5s'");
+      const pidA = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const pidB = (await other.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      expect(pidA).not.toBe(pidB);
+      let externalWinner: Awaited<ReturnType<typeof repository.tryFinishRun>> | undefined;
+      const decide = vi.fn(async () => {
+        // Another connection wins after claim, before this Runtime can finalize.
+        externalWinner = await createRunRepository(other).tryFinishRun(created.id, outcome);
+        return outcome === 'failed'
+          ? { kind: 'final', content: 'MUST_NOT_RETURN' }
+          : { kind: 'tool_request', toolName: 'must_not_execute', arguments: { secret: 'MUST_NOT_RETURN' } };
+      });
+      expect(await runOneDecision(created.id, { repository, decide })).toEqual({ kind: 'finalize_conflict' });
+      // Assert outside decide so Runtime cannot turn an assertion failure into a source error.
+      expect(externalWinner).toEqual({ ...created, status: outcome });
+      expect(decide).toHaveBeenCalledTimes(1);
+      expect(await repository.findRunById(created.id)).toEqual({ ...created, status: outcome });
+      const app = buildApp({ repository, logger: false });
+      try {
+        const get = await app.inject(`/runs/${created.id}`);
+        expect(get.statusCode).toBe(200);
+        expect(get.json()).toEqual({ ...created, status: outcome, createdAt: created.createdAt.toISOString() });
+        console.info(JSON.stringify({ runtimeConflict: 'finalize_conflict', preservedWinner: outcome, getStatus: get.statusCode }));
+      } finally { await app.close(); }
+    } finally { other.release(); }
+  });
+
+  it.each(['missing', 'running', 'completed', 'failed'] as const)('does not decide or change a %s Run', async state => {
+    const repository = createRunRepository(client);
+    let id: string = randomUUID();
+    if (state !== 'missing') {
+      id = (await repository.createRun('not claimable')).id;
+      await repository.tryStartRun(id);
+      if (state !== 'running') await repository.tryFinishRun(id, state);
+    }
+    const before = await repository.findRunById(id);
+    const decide = vi.fn(async () => ({ kind: 'final', content: 'not called' }));
+    expect(await runOneDecision(id, { repository, decide })).toEqual({ kind: 'not_started' });
+    expect(decide).not.toHaveBeenCalled();
+    expect(await repository.findRunById(id)).toEqual(before);
   });
 
   // Deliberately bypass repository validation to exercise PostgreSQL constraints.
