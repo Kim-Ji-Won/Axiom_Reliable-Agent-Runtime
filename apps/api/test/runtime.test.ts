@@ -12,6 +12,7 @@ const cases = [
   { kind: 'invalid_decision', decide: async () => ({ kind: 'final', content, extra: 'RAW_SENTINEL' }), outcome: 'failed' },
   { kind: 'decision_source_error', decide: () => { throw new Error('ERROR_SENTINEL'); }, outcome: 'failed' },
   { kind: 'decision_source_error', decide: async () => { throw new Error('ERROR_SENTINEL'); }, outcome: 'failed' },
+  { kind: 'decision_limit_exceeded', decide: async () => ({ kind: 'continue' }), outcome: 'failed' },
 ] as const;
 
 function setup(decision: RuntimeDependencies['decide'] = cases[0].decide) {

@@ -8,7 +8,8 @@ export type RuntimeResult =
   | { kind: 'unsupported_tool_request' }
   | { kind: 'invalid_decision' }
   | { kind: 'decision_source_error' }
-  | { kind: 'finalize_conflict' };
+  | { kind: 'finalize_conflict' }
+  | { kind: 'decision_limit_exceeded' };
 
 export interface RuntimeDependencies {
   repository: Pick<ReturnType<typeof createRunRepository>, 'tryStartRun'>;
@@ -16,9 +17,9 @@ export interface RuntimeDependencies {
   decide(run: Run): Promise<unknown>;
 }
 
-type DecisionResult = Exclude<RuntimeResult, { kind: 'not_started' | 'finalize_conflict' }>;
+type DecisionResult = Exclude<RuntimeResult, { kind: 'not_started' | 'finalize_conflict' | 'decision_limit_exceeded' }> | { kind: 'continue' };
 
-async function decideOnce(run: Run, decide: RuntimeDependencies['decide']): Promise<DecisionResult> {
+export async function decideOnce(run: Run, decide: RuntimeDependencies['decide']): Promise<DecisionResult> {
   let raw: unknown;
   try {
     raw = await decide(run);
@@ -28,6 +29,7 @@ async function decideOnce(run: Run, decide: RuntimeDependencies['decide']): Prom
   }
   try {
     const decision = parseModelDecision(raw);
+    if (decision.kind === 'continue') return { kind: 'continue' };
     return decision.kind === 'final'
       ? { kind: 'completed', content: decision.content }
       : { kind: 'unsupported_tool_request' };
@@ -41,10 +43,14 @@ export async function runOneDecision(runId: string, dependencies: RuntimeDepende
   if (!finalizer || typeof finalizer.tryFinalizeWithStep !== 'function') {
     throw new Error('Atomic Run finalizer is required');
   }
+  if (!repository || typeof repository.tryStartRun !== 'function' || typeof decide !== 'function') {
+    throw new Error('Runtime dependencies are required');
+  }
   const run = await repository.tryStartRun(runId);
   if (run === null) return { kind: 'not_started' };
 
-  const result = await decideOnce(run, decide);
+  const decision = await decideOnce(run, decide);
+  const result = decision.kind === 'continue' ? { kind: 'decision_limit_exceeded' as const } : decision;
   // Keep persistence outside the decision catches. DB errors reject without retry.
   // A model request is not execution authorization; tool requests fail closed.
   const finished = await finalizer.tryFinalizeWithStep(runId, result.kind);

@@ -5,6 +5,7 @@ import type { RunStep } from './run-step-repository.js';
 
 export const finalizationResultKinds = [
   'completed', 'unsupported_tool_request', 'invalid_decision', 'decision_source_error',
+  'decision_limit_exceeded',
 ] as const;
 export type FinalizationResultKind = typeof finalizationResultKinds[number];
 export interface FinalizedRun { run: Run; step: RunStep }

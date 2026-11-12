@@ -50,7 +50,8 @@ describe('Model Decision contract', () => {
   it('narrows the discriminated union', () => {
     const result: ModelDecision = parseModelDecision(final('ok'));
     if (result.kind === 'final') expectTypeOf(result.content).toEqualTypeOf<string>();
-    else expectTypeOf(result.arguments).toEqualTypeOf<JsonObject>();
+    else if (result.kind === 'tool_request') expectTypeOf(result.arguments).toEqualTypeOf<JsonObject>();
+    else expectTypeOf(result).toEqualTypeOf<{ kind: 'continue' }>();
     expectTypeOf<typeof modelDecisionSchema.parse>().returns.toEqualTypeOf<ModelDecision>();
   });
   it.each(['a', 'a0_-', 'a'.repeat(64)])('accepts toolName boundary %#', toolName => {
@@ -188,5 +189,27 @@ describe('Model Decision contract', () => {
       expect(repository).not.toHaveBeenCalled();
       expect(fetch).not.toHaveBeenCalled();
     } finally { query.mockRestore(); repository.mockRestore(); fetch.mockRestore(); }
+  });
+});
+
+
+describe('continue decision contract', () => {
+  it('accepts only the kind field including frozen and null-prototype objects', () => {
+    accept({ kind: 'continue' });
+    accept(Object.freeze({ kind: 'continue' }));
+    accept(Object.assign(Object.create(null), { kind: 'continue' }));
+  });
+  it.each(['content', 'toolName', 'arguments', 'reason', 'extra'])('rejects extra %s without input disclosure', key => {
+    reject({ kind: 'continue', [key]: 'SECRET_SENTINEL' });
+  });
+  it('rejects accessors, hidden/symbol fields, prototypes, proxies and toJSON without execution', () => {
+    const effect = vi.fn(() => { throw new Error('SECRET_SENTINEL'); });
+    reject(Object.defineProperty({}, 'kind', { enumerable: true, get: effect }));
+    reject(Object.defineProperty({ kind: 'continue' }, 'secret', { value: 'SECRET_SENTINEL' }));
+    reject({ kind: 'continue', [Symbol('SECRET_SENTINEL')]: 1 });
+    reject(Object.assign(Object.create({ inherited: true }), { kind: 'continue' }));
+    reject(new Proxy({ kind: 'continue' }, { get: effect, ownKeys: effect, getPrototypeOf: effect }));
+    reject({ kind: 'continue', toJSON: effect });
+    expect(effect).not.toHaveBeenCalled();
   });
 });

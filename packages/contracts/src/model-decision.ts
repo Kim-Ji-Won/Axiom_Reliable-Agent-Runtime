@@ -72,13 +72,14 @@ function validArguments(root: unknown): root is JsonObject {
 function validDecision(raw: unknown): boolean {
   if (!isPlainObject(raw)) return false;
   const keys = Reflect.ownKeys(raw);
-  if (keys.length !== 2 && keys.length !== 3) return false;
+  if (keys.length !== 1 && keys.length !== 2 && keys.length !== 3) return false;
   for (const key of keys) {
     if (typeof key !== 'string') return false;
     const descriptor = Object.getOwnPropertyDescriptor(raw, key)!;
     if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) return false;
   }
   const kind = Object.getOwnPropertyDescriptor(raw, 'kind')?.value;
+  if (kind === 'continue') return keys.length === 1;
   if (kind === 'final') {
     if (keys.length !== 2 || !keys.includes('content')) return false;
     const content = Object.getOwnPropertyDescriptor(raw, 'content')!.value;
@@ -96,6 +97,7 @@ function validDecision(raw: unknown): boolean {
 }
 
 const decisionVariants = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('continue') }),
   z.strictObject({ kind: z.literal('final'), content: z.string() }),
   z.strictObject({
     kind: z.literal('tool_request'), toolName: z.string(), arguments: z.custom<JsonObject>(),

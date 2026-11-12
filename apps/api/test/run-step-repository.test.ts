@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { PoolClient } from 'pg';
 import { InvalidRunInputError } from '@axiom/contracts';
-import { createRunStepRepository, runStepResultKinds, type RunStep } from '../src/persistence/run-step-repository.js';
+import { createRunStepRepository, appendRunStepResultKinds, type RunStep } from '../src/persistence/run-step-repository.js';
 
 const id = '12345678-1234-4234-8234-123456789abc';
 const timestamp = new Date('2026-11-12T00:00:00Z');
@@ -20,7 +20,7 @@ describe('Run Step repository boundaries', () => {
     await expect(repo.listRunSteps(id as string)).rejects.toThrow('Invalid Run ID');
     expect(connect).not.toHaveBeenCalled();
   });
-  it.each(['not_started', 'running', '', 'SECRET_SENTINEL', null, {}, 1, undefined])('rejects result kind %# before DB calls', async kind => {
+  it.each(['continued', 'decision_limit_exceeded', 'not_started', 'running', '', 'SECRET_SENTINEL', null, {}, 1, undefined])('rejects result kind %# before DB calls', async kind => {
     const { repo, connect } = setup();
     const logs = ['log', 'info', 'warn', 'error', 'debug'] as const;
     const spies = logs.map(method => vi.spyOn(console, method));
@@ -28,7 +28,7 @@ describe('Run Step repository boundaries', () => {
     expect(connect).not.toHaveBeenCalled();
     spies.forEach(spy => expect(spy).not.toHaveBeenCalled());
   });
-  it.each(runStepResultKinds)('returns only the four metadata fields for %s', async kind => {
+  it.each(appendRunStepResultKinds)('returns only the four metadata fields for %s', async kind => {
     const { repo, query, release, connect } = setup();
     query.mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ id }] })
