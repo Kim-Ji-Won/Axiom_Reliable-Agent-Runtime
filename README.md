@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P1-G — Bounded Decision Loop 구현·검토 중. P0-A1~A4 및 P1-A~F 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
+**현재 단계: P2-A — Trusted Tool Registry + Input Snapshot Validation 구현·검토 중. P0-A1~A4 및 P1-A~G 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합까지입니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -61,7 +61,8 @@ Axiom/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
 │   │   ├── persistence/        # DB pool, Run/Step, atomic finalizer, continue recorder
-│   │   └── runtime/            # run-one-decision.ts / run-bounded-decisions.ts
+│   │   ├── runtime/            # run-one-decision.ts / run-bounded-decisions.ts
+│   │   └── tools/              # tool-registry.ts / tool-request-resolver.ts / tool-arguments-snapshot.ts
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
@@ -71,6 +72,8 @@ Axiom/
 │   │   ├── run-continue-recorder.test.ts # continued 트랜잭션·연결 정리
 │   │   ├── runtime.test.ts     # claim·결정·종료 및 오류 경계
 │   │   ├── model-decision.test.ts # 모델 결정·JSON 안전성 및 경계 검증
+│   │   ├── tool-request-resolver.test.ts # Registry·strict schema·TOCTOU·비실행 경계
+│   │   ├── tool-arguments-snapshot.test.ts # JSON 경계·독립 복사·deep freeze
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
 │   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime.test.ts, process-fixture.ts
 │   ├── package.json
@@ -232,7 +235,7 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 
 Node.js의 `util.types.isProxy`로 Proxy를 탐지해 trap 실행 전에 거부합니다. 같은 realm의 plain object(Object.prototype 또는 null prototype)와 밀집 배열만 받으며 accessor·symbol key·숨겨진 속성·사용자 지정 prototype·비 JSON 객체·순환 참조를 거부합니다. 방문 깊이와 값/문자열 처리량은 제한하지만 `Reflect.ownKeys` 자체는 전달된 객체의 전체 키 목록을 생성합니다. 입력 객체의 생성 및 전송 크기 제한은 호출 경계에서도 적용해야 합니다. 현재 구현은 Node.js용이며 브라우저 지원은 검증하지 않았습니다.
 
-`parseModelDecision`은 실패 시 Run 입력 오류와 별개의 `InvalidModelDecisionError`를 던집니다. 스키마는 Zod 오류를 반환하며, 실패 입력은 오류 생성 전에 제거해 `reportInput` 옵션에서도 원문·인자·비밀정보가 담기지 않도록 합니다. 검증된 인자는 복사·freeze하지 않으므로 호출자는 검증 후 입력을 변경하지 않고 사용해야 합니다.
+`parseModelDecision`은 실패 시 Run 입력 오류와 별개의 `InvalidModelDecisionError`를 던집니다. 스키마는 Zod 오류를 반환하며, 실패 입력은 오류 생성 전에 제거해 `reportInput` 옵션에서도 원문·인자·비밀정보가 담기지 않도록 합니다. 이 parser 자체는 인자를 복사·freeze하지 않으며 중첩 참조를 유지합니다. P2-A Resolver는 이 결과도 다시 검증하고 독립적인 불변 snapshot으로 전환합니다.
 
 **A model request is not execution authorization.** `tool_request`는 모델의 도구 요청 제안이며 실행 승인은 별도 Runtime 정책의 책임입니다. `final`도 최종 텍스트 제안입니다. P1-C는 결정 계약과 입력 검증을 담당합니다. 내부 실행 제어는 아래 Runtime에 있으며 모델 호출·provider adapter·권한 정책·실제 도구 실행은 후속 단계입니다.
 
@@ -305,7 +308,7 @@ INSERT 및 확정적인 COMMIT 실패에서는 Run UPDATE와 Step INSERT를 함�
 
 원자적 범위는 **종료 상태 + 결과 Step 한 건**입니다. 시작·decide·종료 전체가 하나의 트랜잭션은 아니며 프로세스 장애나 DB 오류 뒤 running이 남을 수 있습니다. 기존 direct `tryFinishRun()`은 Step을 자동 기록하지 않고 별도 `appendRunStep()`도 종료를 의미하지 않습니다. 순번은 지원되는 부모 잠금 경로에서만 보장합니다. Durable/Exactly-Once, retry, recovery, 실제 모델·도구 실행은 보장하거나 구현하지 않습니다. P1-F는 병합 완료됐습니다. `continued`는 종료 입력으로 거부합니다.
 
-### Bounded Decision Loop · 제한된 내부 반복 (P1-G 구현·검토 중)
+### Bounded Decision Loop · 제한된 내부 반복 (P1-G 완료)
 
 `runBoundedDecisions(runId, { repository, finalizer, continueRecorder, decide }, { maxDecisions })`는 `run-one-decision.ts`와 별도의 내부 API입니다. `maxDecisions`는 필수 정수 **1~5**이며 잘못된 값이나 필수 의존성 누락은 claim·DB 접근·decide 전에 고정 오류로 거부합니다. claim은 한 번만 시도하고, 실패하면 `not_started`로 반환하며 Step을 쓰지 않습니다.
 
@@ -343,6 +346,35 @@ Continue INSERT 실패는 rollback하며 COMMIT 오류와 rollback 실패 연결
 
 DB 저장·조회는 durable execution이나 crash recovery를 의미하지 않습니다. 해당 실행 의미와 검증은 P3 범위입니다.
 
+## Tool Registry & Input Snapshot · 실행 없는 검증 (P2-A 구현·검토 중)
+
+`apps/api/src/tools/`는 Runtime과 연결되지 않은 내부 검증 계층입니다. `createToolRegistry(definitions)`는 신뢰된 애플리케이션 코드가 제공한 `{ name, inputSchema }` 목록만 사용합니다. 실제 도구 정의나 handler는 기본 등록하지 않습니다. 이름은 기존 Model Decision의 1~64자 규칙을 재사용하고 중복·잘못된 이름은 고정된 설정 오류로 거부합니다. 비공개 Map을 사용하므로 prototype chain을 조회하지 않으며 빈 Registry에는 기본 허용 도구가 없습니다. `constructor` 같은 유효한 이름도 명시적으로 등록해야 조회됩니다.
+
+`lookup(name)`은 동결된 canonical name 정보만 반환합니다. 원래 정의 배열·객체 및 schema shape 교체는 등록 내용에 영향을 주지 않습니다. schema는 외부에 노출하지 않고 `accepts(name, snapshot)`으로 동기 검증합니다. 이 API도 전달된 인자를 다시 snapshot으로 만들어 검증합니다.
+
+```ts
+// 신뢰된 애플리케이션 코드의 검증용 예시. 실제 검색·네트워크 요청은 없습니다.
+const registry = createToolRegistry([
+  { name: 'search_documents', inputSchema: z.strictObject({ query: z.string().min(1).max(200) }) },
+]);
+const result = resolveToolRequest(registry, {
+  kind: 'tool_request', toolName: 'search_documents', arguments: { query: 'PostgreSQL' },
+});
+// { kind: 'validated_tool_request', toolName: 'search_documents', arguments: frozenSnapshot }
+```
+
+Resolver 순서는 **Model Decision 재검증 → tool_request 구분 → Registry 조회 → 인자 재검증·독립 snapshot → 도구별 strict schema → snapshot 반환**입니다. 성공 결과는 `validated_tool_request`, 실패·비대상 결과는 `not_tool_request`, `unknown_tool`, `invalid_tool_arguments`, `invalid_model_decision`입니다. JSON 계약 자체가 깨졌으면 `invalid_model_decision`, 유효한 JSON이 도구별 스키마에 맞지 않으면 `invalid_tool_arguments`입니다. 실패 결과는 kind만 포함하고 Zod issues·원본 인자·모델 원문·자격증명·예외 원인을 반환하거나 로그에 남기지 않습니다.
+
+Snapshot은 기존 `parseModelDecision()`의 descriptor 기반 JSON 검증을 재사용합니다. 같은 동기 호출 안에서 await·외부 callback 없이 다시 descriptor를 읽어 복사하고 각 중첩 객체·배열까지 freeze합니다. JSON 객체는 null prototype으로 생성하고 키는 `defineProperty`로 기록하므로 `__proto__`도 setter로 실행되지 않습니다. 원본과 중첩 참조를 공유하지 않으며 shared reference는 위치별로 복사합니다. TypeScript도 재귀 readonly 타입을 제공합니다. 원본에 `JSON.stringify`나 `structuredClone`을 적용하지 않습니다.
+
+기존 8192 UTF-8 bytes·container depth 8, Proxy·accessor·symbol·hidden property·순환·sparse array·비 JSON 객체 거부 조건을 유지합니다. parse 이후 원본을 바꾼 경우 최신 값을 재검증하며, snapshot 이후 원본 변경이나 snapshot 수정 시도는 검증 결과를 바꾸지 못합니다. Zod 출력은 다시 JSON 검증해 snapshot과 값이 같은지 확인하지만 **최종 반환에는 사용하지 않습니다**. 이로써 스키마가 별도로 보관한 출력 객체와도 참조가 분리됩니다.
+
+도구 스키마는 루트 및 모든 중첩 객체에 `z.strictObject`를 사용해야 합니다. 지원 범위는 object, array, string, number, boolean, null, literal, enum, optional, nullable, union과 동기 검증 check입니다. coercion·default·prefault·catch·transform·overwrite, permissive object, any/unknown, lazy 등은 등록 단계에서 거부합니다. 스키마 컨테이너는 복사하지만 refinement/check 함수와 Zod 정의 자체는 신뢰된 코드 영역입니다. 이들은 순수하고 동기적으로 작성해야 하며, 임의의 애플리케이션 코드나 스키마 내부 구현 변조를 격리하는 sandbox는 아닙니다. 입력 전체 키 목록 생성 비용 및 입력 생성·전송 크기는 호출 경계에서도 제한해야 합니다.
+
+**A model request is not execution authorization.** 조회·검증 성공은 실행 승인·사용자 동의가 아닙니다. Handler/Executor, 외부 모델 API, 실제 Tool·network·filesystem·shell 호출은 추가하지 않았습니다. 기존 one-shot/bounded Runtime은 계속 tool_request를 `failed + unsupported_tool_request`로 종료합니다. HTTP endpoint, Run 상태, 다섯 DB migration과 저장 데이터는 그대로이며 Tool arguments를 DB에 저장하지 않습니다.
+
+후속 P2 단계에서 실행·Runtime 통합·결과 처리 책임을 별도 설계하고 승인받습니다. 사용자 승인, 권한 및 정책 집행은 P4 Safety & Governance의 별도 책임입니다. P2-A는 아직 병합 전 구현·검토 상태입니다.
+
 ## Run HTTP API · 생성과 조회
 
 루트에서 `npm run build` 후 `npm start`를 실행합니다. `npm start`는 저장소 루트의 `.env`를 읽으며, 기존 환경 변수가 우선합니다. `packages/contracts`의 Zod 스키마와 타입은 workspace 패키지로 공유하고 빌드 시 JavaScript 및 타입 선언을 생성합니다.
@@ -376,20 +408,20 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
-| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder 검증 (DB 불필요) |
+| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder·Tool Registry·snapshot 보안 검증 (DB 불필요) |
 | `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 재시작 영속성, Runtime 동시 claim·종료 경합, Step 동시 append·bounded 실행·종료 경합·INSERT/COMMIT 실패 rollback·안전한 down |
 
 health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 SIGINT/SIGTERM 종료 신호는 A3에서 별도로 검증했습니다. A4 DB 테스트는 서로 다른 프로세스가 실제 loopback 포트에서 HTTP를 처리하고 정상 종료하는 흐름을 추가합니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A~F는 완료됐으며 P1-G는 Bounded Decision Loop 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A~G는 완료됐으며 P2-A는 Trusted Tool Registry + Input Snapshot Validation 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
-| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~F 완료; P1-G Bounded Decision Loop 구현·검토 중; 나머지 예정 |
-| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
+| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
+| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A 실행 없는 Registry·snapshot 검증 구현·검토 중; 실행·연동은 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
