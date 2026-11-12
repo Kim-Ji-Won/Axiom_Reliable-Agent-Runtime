@@ -5,7 +5,8 @@ export const appendRunStepResultKinds = [
   'completed', 'unsupported_tool_request', 'invalid_decision',
   'decision_source_error', 'finalize_conflict',
 ] as const;
-export const runStepResultKinds = [...appendRunStepResultKinds, 'continued', 'decision_limit_exceeded'] as const;
+export const runStepResultKinds = [...appendRunStepResultKinds, 'continued', 'decision_limit_exceeded',
+  'tool_succeeded', 'tool_failed', 'tool_request_rejected', 'tool_execution_limit_exceeded'] as const;
 export type AppendRunStepResultKind = typeof appendRunStepResultKinds[number];
 export type RunStepResultKind = typeof runStepResultKinds[number];
 
