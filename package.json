@@ -20,7 +20,7 @@
     "db:stop": "docker compose stop",
     "db:migrate": "node --env-file-if-exists=.env --import tsx db/migrate-cli.ts dev",
     "db:migrate:test": "node --env-file-if-exists=.env --import tsx db/migrate-cli.ts test",
-    "test:db": "node --env-file-if-exists=.env --import tsx node_modules/vitest/vitest.mjs run apps/api/test/db/runs.test.ts apps/api/test/db/run-steps.test.ts apps/api/test/db/atomic-finalization.test.ts apps/api/test/db/bounded-runtime.test.ts --no-file-parallelism",
+    "test:db": "node --env-file-if-exists=.env --import tsx node_modules/vitest/vitest.mjs run apps/api/test/db/runs.test.ts apps/api/test/db/run-steps.test.ts apps/api/test/db/atomic-finalization.test.ts apps/api/test/db/bounded-runtime.test.ts apps/api/test/db/bounded-tool-runtime.test.ts --no-file-parallelism",
     "build:contracts": "npm run build --workspace=@axiom/contracts",
     "pretest": "npm run build:contracts",
     "pretest:db": "npm run build:contracts",
