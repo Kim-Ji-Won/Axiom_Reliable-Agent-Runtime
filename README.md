@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P2-B — Tool Dispatch Preflight + Execution Outcome Contract 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
+**현재 단계: P2-C — Safe In-Memory Tool Executor 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A~B 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight와 실행 결과 데이터 계약까지입니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight·실행 결과 데이터 계약과 신뢰된 순수 Handler를 위한 내부 In-Memory Executor까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -48,7 +48,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 `/health`는 **API liveness**만 나타냅니다. 데이터베이스 readiness나 외부 의존성의 정상 동작을 확인하지 않습니다.
 
-P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. P0-A3에서는 Run 생성·조회 API를 추가했습니다. 모델 호출, 도구 실행, 워커, 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
+P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. P0-A3에서는 Run 생성·조회 API를 추가했습니다. 모델 호출, 외부 부작용 도구 실행, 워커, 사용자 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
 
 ## Architecture · 프로젝트 구조
 
@@ -62,7 +62,7 @@ Axiom/
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
 │   │   ├── persistence/        # DB pool, Run/Step, atomic finalizer, continue recorder
 │   │   ├── runtime/            # run-one-decision.ts / run-bounded-decisions.ts
-│   │   └── tools/              # Registry / Resolver / Snapshot / Dispatch Preflight / Outcome
+│   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / In-Memory Executor
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
@@ -76,6 +76,7 @@ Axiom/
 │   │   ├── tool-arguments-snapshot.test.ts # JSON 경계·독립 복사·deep freeze
 │   │   ├── tool-dispatch-preflight.test.ts # UUID·재검증·불변 Plan·비실행 경계
 │   │   ├── tool-execution-outcome.test.ts # strict 결과 계약·output snapshot·오류 비노출
+│   │   ├── in-memory-tool-executor.test.ts # Default Deny·Gate·Handler·출력 및 I/O 경계
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
 │   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime.test.ts, process-fixture.ts
 │   ├── package.json
@@ -373,11 +374,11 @@ Snapshot은 기존 `parseModelDecision()`의 descriptor 기반 JSON 검증을 �
 
 도구 스키마는 루트 및 모든 중첩 객체에 `z.strictObject`를 사용해야 합니다. 지원 범위는 object, array, string, number, boolean, null, literal, enum, optional, nullable, union과 동기 검증 check입니다. coercion·default·prefault·catch·transform·overwrite, permissive object, any/unknown, lazy 등은 등록 단계에서 거부합니다. 스키마 컨테이너는 복사하지만 refinement/check 함수와 Zod 정의 자체는 신뢰된 코드 영역입니다. 이들은 순수하고 동기적으로 작성해야 하며, 임의의 애플리케이션 코드나 스키마 내부 구현 변조를 격리하는 sandbox는 아닙니다. 입력 전체 키 목록 생성 비용 및 입력 생성·전송 크기는 호출 경계에서도 제한해야 합니다.
 
-**A model request is not execution authorization.** 조회·검증 성공은 실행 승인·사용자 동의가 아닙니다. Handler/Executor, 외부 모델 API, 실제 Tool·network·filesystem·shell 호출은 추가하지 않았습니다. 기존 one-shot/bounded Runtime은 계속 tool_request를 `failed + unsupported_tool_request`로 종료합니다. HTTP endpoint, Run 상태, 다섯 DB migration과 저장 데이터는 그대로이며 Tool arguments를 DB에 저장하지 않습니다.
+**A model request is not execution authorization.** 조회·검증 성공은 실행 승인·사용자 동의가 아닙니다. P2-A 검증 계층 자체는 Handler/Executor, 외부 모델 API, 실제 Tool·network·filesystem·shell을 호출하지 않습니다. 기존 one-shot/bounded Runtime은 계속 tool_request를 `failed + unsupported_tool_request`로 종료합니다. HTTP endpoint, Run 상태, 다섯 DB migration과 저장 데이터는 그대로이며 Tool arguments를 DB에 저장하지 않습니다.
 
 후속 P2 단계에서 실행·Runtime 통합·결과 처리 책임을 별도 설계하고 승인받습니다. 사용자 승인, 권한 및 정책 집행은 P4 Safety & Governance의 별도 책임입니다. P2-A는 병합과 main 회귀 검증을 완료했습니다.
 
-## Tool Dispatch & Outcome · 실행 전 계약 (P2-B 구현·검토 중)
+## Tool Dispatch & Outcome · 실행 전 계약 (P2-B 완료)
 
 `prepareToolDispatch(registry, runId, rawDecision)`는 기존 `runIdSchema`로 UUID를 먼저 검증한 뒤 **실제 `resolveToolRequest()`를 호출**합니다. Raw Decision과 도구별 입력을 재검증하며, 위조한 `validated_tool_request`나 `approved`·`authorized`·`allow`·`permission` 추가 필드는 거부합니다. 이미 파싱한 Decision도 최신 상태로 다시 검사합니다.
 
@@ -401,9 +402,49 @@ Plan 최상위도 동결하며 원본 변경은 중첩 snapshot에 영향을 주
 
 성공 output은 `snapshotToolArguments()`를 재사용해 JSON Object Root로 검증·복사·deep freeze합니다. **Output 자체 기준 UTF-8 8192 bytes, container depth 8**을 유지하고 envelope도 동결합니다. null-prototype·안전한 특수 키는 보존하며 Proxy·accessor·비 JSON 값·숨겨진 속성·symbol·sparse array·순환 참조는 거부합니다. `toJSON`을 실행하지 않고 원본 참조를 반환하지 않습니다.
 
-Outcome은 합성 테스트 데이터도 파싱할 수 있는 데이터 계약이며 실제 도구 실행 사실이나 정책 승인을 증명하지 않습니다. 모델의 성공 주장만으로 실행 완료를 인정하지 않습니다. **Handler/Executor, 실제 외부 호출, Runtime 자동 연동, DB 저장·migration 및 HTTP 추가는 없습니다.** 기존 Runtime은 계속 `tool_request`를 `failed + unsupported_tool_request`로 종료합니다.
+Outcome은 합성 테스트 데이터도 파싱할 수 있는 데이터 계약이며 실제 도구 실행 사실이나 정책 승인을 증명하지 않습니다. 모델의 성공 주장만으로 실행 완료를 인정하지 않습니다. **P2-B 계약 자체는 Handler를 호출하지 않으며 실제 외부 호출, Runtime 자동 연동, DB 저장·migration 및 HTTP 추가도 없습니다.** 기존 Runtime은 계속 `tool_request`를 `failed + unsupported_tool_request`로 종료합니다.
 
-후속 **P2-C**에서 신뢰된 Executor/Dispatch와 실행 결과 생성 경계를 설계하고, **P4 Safety & Governance**에서 사용자 승인·권한·정책 집행을 담당합니다. P2-A처럼 신뢰된 스키마 refinement/check는 순수한 동기 코드라는 전제가 있으며 임의의 애플리케이션 코드 부작용을 격리하지 않습니다. P2-B는 아직 병합 전 구현·검토 상태입니다.
+P2-B는 병합과 main 회귀 검증을 완료했습니다. 아래 P2-C는 이 계약을 재사용하는 내부 실행 경계입니다. P2-A처럼 신뢰된 스키마 refinement/check는 순수한 동기 코드라는 전제가 있으며 임의의 애플리케이션 코드 부작용을 격리하지 않습니다.
+
+## In-Memory Tool Executor · 신뢰된 순수 Handler 실행 (P2-C 구현·검토 중)
+
+`createInMemoryToolExecutor({ registry, handlers, permitExecution? })`는 동결된 내부 API `execute(runId, rawDecision): Promise<InMemoryToolExecutionResult>`를 제공합니다. 매 요청마다 **P2-B Preflight 재검증 → Trusted Host Gate → 등록된 Handler 조회 → 한 번 호출 → P2-B Outcome 검증** 순서를 따릅니다. 공개 API는 기존 Plan을 실행 명령으로 받지 않습니다.
+
+Handler는 신뢰된 호스트가 생성 시 전달하는 `{ name, handle }` 목록입니다. Registry에 등록된 유효 이름과 함수만 허용하며 중복·잘못된 구성은 고정 오류로 거부합니다. 비공개 Map에 이름과 함수 참조를 복사하므로 원래 배열·정의 객체·options를 나중에 바꿔도 실행 대상이나 Gate가 교체되지 않습니다. 기본 Handler나 실제 외부 도구를 자동 등록하지 않습니다.
+
+**Default Deny:** Gate가 없으면 `tool_failed + execution_unavailable`입니다. 생성 시 설치한 동기 `permitExecution(plan)`을 매번 다시 호출해 정확히 boolean `true`인 경우만 실행합니다. `false`·비Boolean·Promise·thenable·throw는 거부하며 Handler 호출은 0회입니다. 잘못 반환한 native Promise의 rejection도 관찰해 처리합니다. Gate에는 raw decision이 아닌 불변 Plan만 전달합니다. Gate는 사용자 인증·동의나 P4 정책 엔진을 대신하지 않습니다.
+
+```ts
+// 테스트용 순수 인메모리 예시. 앱이나 HTTP에 자동 등록하지 않습니다.
+const registry = createToolRegistry([
+  { name: 'echo', inputSchema: z.strictObject({ message: z.string().min(1) }) },
+]);
+const executor = createInMemoryToolExecutor({
+  registry,
+  handlers: [{ name: 'echo', handle: args => ({ message: args.message }) }],
+  permitExecution: plan => plan.toolName === 'echo',
+});
+const outcome = await executor.execute('12345678-1234-4234-8234-123456789abc', {
+  kind: 'tool_request', toolName: 'echo', arguments: { message: 'hello' },
+});
+// { kind: 'tool_succeeded', output: { message: 'hello' } } — 독립 deep-frozen snapshot
+```
+
+허용된 단일 호출은 Handler를 정확히 한 번 invoke하고 P2-A의 불변 arguments snapshot만 전달합니다. 동기 JSON object 또는 native Promise의 결과를 처리합니다. 일반 객체를 무조건 `await`하지 않으므로 악성 `then` getter나 thenable 함수를 실행하지 않습니다. custom thenable은 지원하지 않으며, native Promise를 사용하는 호스트 코드와 Promise constructor/species·런타임 내장 함수의 무결성은 신뢰 전제입니다. Handler가 Promise를 생성하는 과정에서 수행하는 코드도 격리하지 않습니다.
+
+| 상황 | 결과 |
+| --- | --- |
+| Preflight 실패 | 기존 다섯 실패 kind 그대로; Gate·Handler 호출 없음 |
+| Gate 누락·거부·오류 또는 Handler 없음 | `tool_failed + execution_unavailable` |
+| Handler throw / Promise reject | `tool_failed + handler_error` |
+| 잘못된 JSON output | `tool_failed + invalid_tool_output` |
+| 안전한 JSON object output | `tool_succeeded + output` |
+
+성공 출력은 기존 `parseToolExecutionOutcome()`으로 복사·동결하며 UTF-8 8192 bytes·깊이 8, Proxy·accessor·순환·sparse array·비 JSON 값 거부를 유지합니다. 실패 결과에는 raw error·message·cause·stack·원본 인자·credential을 넣지 않으며 자동 로깅·저장도 하지 않습니다. 자동 재시도는 없고, 서로 다른 execute 호출은 각각 실행하므로 중복 방지·Exactly-Once를 보장하지 않습니다.
+
+**A model request is not execution authorization.** `pending_authorization`은 실행 허가증이 아니고 Outcome 객체도 실행 사실의 위조 불가능한 증명이 아닙니다. 신뢰된 순수 테스트 Handler만 등록한다는 계약이며 임의 함수·closure·refinement의 부작용을 막는 sandbox가 아닙니다. 실제 Run 존재·running 상태·lease·사용자 권한을 확인하지 않습니다. 무한 실행 Handler 중지, timeout·cancellation·retry·durable execution도 지원하지 않습니다.
+
+현재 HTTP·One-Shot/Bounded Runtime·DB·worker·Model Provider와 연결하지 않았습니다. 기존 Runtime은 계속 Tool Request를 `failed + unsupported_tool_request`로 종료합니다. 프로덕션 파일·네트워크·DB·shell·Browser·Plugin 도구, 결과 persistence 및 새 HTTP/migration은 없습니다. 후속 **P2-D**에서 실행 통합과 live Run 상태 경계를, **P4**에서 실제 사용자 인증·승인·정책을 별도 승인하에 설계합니다. P2-C는 아직 병합 전 구현·검토 상태입니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -438,20 +479,20 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
-| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder·Tool Registry·snapshot·Dispatch Preflight·Outcome 보안 검증 (DB 불필요) |
+| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder·Tool Registry·snapshot·Dispatch Preflight·Outcome·In-Memory Executor 보안 검증 (DB 불필요) |
 | `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 재시작 영속성, Runtime 동시 claim·종료 경합, Step 동시 append·bounded 실행·종료 경합·INSERT/COMMIT 실패 rollback·안전한 down |
 
 health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 SIGINT/SIGTERM 종료 신호는 A3에서 별도로 검증했습니다. A4 DB 테스트는 서로 다른 프로세스가 실제 loopback 포트에서 HTTP를 처리하고 정상 종료하는 흐름을 추가합니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A는 완료됐으며 P2-B는 Tool Dispatch Preflight + Execution Outcome Contract 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~B는 완료됐으며 P2-C는 Safe In-Memory Tool Executor 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
-| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A 완료; P2-B 실행 전 계약 구현·검토 중; P2-C 실행·연동은 예정 |
+| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~B 완료; P2-C 순수 Handler Executor 구현·검토 중; 실제 외부 연동은 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
