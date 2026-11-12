@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P2-A — Trusted Tool Registry + Input Snapshot Validation 구현·검토 중. P0-A1~A4 및 P1-A~G 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
+**현재 단계: P2-B — Tool Dispatch Preflight + Execution Outcome Contract 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증까지입니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight와 실행 결과 데이터 계약까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -62,7 +62,7 @@ Axiom/
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
 │   │   ├── persistence/        # DB pool, Run/Step, atomic finalizer, continue recorder
 │   │   ├── runtime/            # run-one-decision.ts / run-bounded-decisions.ts
-│   │   └── tools/              # tool-registry.ts / tool-request-resolver.ts / tool-arguments-snapshot.ts
+│   │   └── tools/              # Registry / Resolver / Snapshot / Dispatch Preflight / Outcome
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
@@ -74,6 +74,8 @@ Axiom/
 │   │   ├── model-decision.test.ts # 모델 결정·JSON 안전성 및 경계 검증
 │   │   ├── tool-request-resolver.test.ts # Registry·strict schema·TOCTOU·비실행 경계
 │   │   ├── tool-arguments-snapshot.test.ts # JSON 경계·독립 복사·deep freeze
+│   │   ├── tool-dispatch-preflight.test.ts # UUID·재검증·불변 Plan·비실행 경계
+│   │   ├── tool-execution-outcome.test.ts # strict 결과 계약·output snapshot·오류 비노출
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
 │   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime.test.ts, process-fixture.ts
 │   ├── package.json
@@ -346,7 +348,7 @@ Continue INSERT 실패는 rollback하며 COMMIT 오류와 rollback 실패 연결
 
 DB 저장·조회는 durable execution이나 crash recovery를 의미하지 않습니다. 해당 실행 의미와 검증은 P3 범위입니다.
 
-## Tool Registry & Input Snapshot · 실행 없는 검증 (P2-A 구현·검토 중)
+## Tool Registry & Input Snapshot · 실행 없는 검증 (P2-A 완료)
 
 `apps/api/src/tools/`는 Runtime과 연결되지 않은 내부 검증 계층입니다. `createToolRegistry(definitions)`는 신뢰된 애플리케이션 코드가 제공한 `{ name, inputSchema }` 목록만 사용합니다. 실제 도구 정의나 handler는 기본 등록하지 않습니다. 이름은 기존 Model Decision의 1~64자 규칙을 재사용하고 중복·잘못된 이름은 고정된 설정 오류로 거부합니다. 비공개 Map을 사용하므로 prototype chain을 조회하지 않으며 빈 Registry에는 기본 허용 도구가 없습니다. `constructor` 같은 유효한 이름도 명시적으로 등록해야 조회됩니다.
 
@@ -373,7 +375,35 @@ Snapshot은 기존 `parseModelDecision()`의 descriptor 기반 JSON 검증을 �
 
 **A model request is not execution authorization.** 조회·검증 성공은 실행 승인·사용자 동의가 아닙니다. Handler/Executor, 외부 모델 API, 실제 Tool·network·filesystem·shell 호출은 추가하지 않았습니다. 기존 one-shot/bounded Runtime은 계속 tool_request를 `failed + unsupported_tool_request`로 종료합니다. HTTP endpoint, Run 상태, 다섯 DB migration과 저장 데이터는 그대로이며 Tool arguments를 DB에 저장하지 않습니다.
 
-후속 P2 단계에서 실행·Runtime 통합·결과 처리 책임을 별도 설계하고 승인받습니다. 사용자 승인, 권한 및 정책 집행은 P4 Safety & Governance의 별도 책임입니다. P2-A는 아직 병합 전 구현·검토 상태입니다.
+후속 P2 단계에서 실행·Runtime 통합·결과 처리 책임을 별도 설계하고 승인받습니다. 사용자 승인, 권한 및 정책 집행은 P4 Safety & Governance의 별도 책임입니다. P2-A는 병합과 main 회귀 검증을 완료했습니다.
+
+## Tool Dispatch & Outcome · 실행 전 계약 (P2-B 구현·검토 중)
+
+`prepareToolDispatch(registry, runId, rawDecision)`는 기존 `runIdSchema`로 UUID를 먼저 검증한 뒤 **실제 `resolveToolRequest()`를 호출**합니다. Raw Decision과 도구별 입력을 재검증하며, 위조한 `validated_tool_request`나 `approved`·`authorized`·`allow`·`permission` 추가 필드는 거부합니다. 이미 파싱한 Decision도 최신 상태로 다시 검사합니다.
+
+```ts
+// 검증된 UUID, Registry의 canonical name, P2-A의 독립적인 deep-frozen arguments
+{ kind: 'pending_authorization', runId, toolName, arguments }
+```
+
+Plan 최상위도 동결하며 원본 변경은 중첩 snapshot에 영향을 주지 않습니다. 실패는 `invalid_run_id`, `not_tool_request`, `unknown_tool`, `invalid_tool_arguments`, `invalid_model_decision` 중 하나의 **kind만** 반환합니다. 원본 입력·Zod issues·예외 원인은 반환하거나 기록하지 않습니다.
+
+`pending_authorization`은 아직 실행 승인을 받지 않은 데이터입니다. UUID 검증은 DB의 Run 존재·running 상태·사용자 승인·실행 권한·lease를 확인하지 않습니다. Plan은 위조 불가능한 capability나 authorization token이 아닙니다.
+
+`parseToolExecutionOutcome(raw: unknown): ToolExecutionOutcome`은 아래 두 형태만 허용하는 strict union입니다. Envelope의 Proxy·prototype·own property descriptor를 먼저 검사하므로 비신뢰 getter나 Proxy trap으로 속성을 읽지 않습니다.
+
+```ts
+{ kind: 'tool_succeeded', output: { message: 'synthetic example' } }
+{ kind: 'tool_failed', code: 'handler_error' }
+```
+
+실패 code allowlist는 `handler_error`, `invalid_tool_output`, `execution_unavailable`입니다. 추가 필드, 임의 message·cause·stack, 성공 output과 실패 code의 혼합을 거부합니다. 잘못된 입력은 원본 데이터나 cause 없이 고정된 `InvalidToolExecutionOutcomeError('Invalid tool execution outcome')`로 거부합니다.
+
+성공 output은 `snapshotToolArguments()`를 재사용해 JSON Object Root로 검증·복사·deep freeze합니다. **Output 자체 기준 UTF-8 8192 bytes, container depth 8**을 유지하고 envelope도 동결합니다. null-prototype·안전한 특수 키는 보존하며 Proxy·accessor·비 JSON 값·숨겨진 속성·symbol·sparse array·순환 참조는 거부합니다. `toJSON`을 실행하지 않고 원본 참조를 반환하지 않습니다.
+
+Outcome은 합성 테스트 데이터도 파싱할 수 있는 데이터 계약이며 실제 도구 실행 사실이나 정책 승인을 증명하지 않습니다. 모델의 성공 주장만으로 실행 완료를 인정하지 않습니다. **Handler/Executor, 실제 외부 호출, Runtime 자동 연동, DB 저장·migration 및 HTTP 추가는 없습니다.** 기존 Runtime은 계속 `tool_request`를 `failed + unsupported_tool_request`로 종료합니다.
+
+후속 **P2-C**에서 신뢰된 Executor/Dispatch와 실행 결과 생성 경계를 설계하고, **P4 Safety & Governance**에서 사용자 승인·권한·정책 집행을 담당합니다. P2-A처럼 신뢰된 스키마 refinement/check는 순수한 동기 코드라는 전제가 있으며 임의의 애플리케이션 코드 부작용을 격리하지 않습니다. P2-B는 아직 병합 전 구현·검토 상태입니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -408,20 +438,20 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
-| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder·Tool Registry·snapshot 보안 검증 (DB 불필요) |
+| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder·Tool Registry·snapshot·Dispatch Preflight·Outcome 보안 검증 (DB 불필요) |
 | `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 재시작 영속성, Runtime 동시 claim·종료 경합, Step 동시 append·bounded 실행·종료 경합·INSERT/COMMIT 실패 rollback·안전한 down |
 
 health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 SIGINT/SIGTERM 종료 신호는 A3에서 별도로 검증했습니다. A4 DB 테스트는 서로 다른 프로세스가 실제 loopback 포트에서 HTTP를 처리하고 정상 종료하는 흐름을 추가합니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A~G는 완료됐으며 P2-A는 Trusted Tool Registry + Input Snapshot Validation 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A는 완료됐으며 P2-B는 Tool Dispatch Preflight + Execution Outcome Contract 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
-| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A 실행 없는 Registry·snapshot 검증 구현·검토 중; 실행·연동은 예정 |
+| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A 완료; P2-B 실행 전 계약 구현·검토 중; P2-C 실행·연동은 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
