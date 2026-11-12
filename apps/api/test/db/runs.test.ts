@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createAtomicRunFinalizer } from '../../src/persistence/atomic-run-finalizer.js';
 import { runOneDecision } from '../../src/runtime/run-one-decision.js';
 import type { Pool, PoolClient } from 'pg';
 import { createDatabase, withDatabase } from '../../src/persistence/database.js';
@@ -280,6 +281,7 @@ describe('real PostgreSQL persistence', () => {
       const content = '  temporary final 😀  ';
       const deps = connections.map(connection => ({
         repository: createRunRepository(connection),
+        finalizer: createAtomicRunFinalizer({ connect: async () => ({ query: connection.query.bind(connection), release: () => {} }) }),
         decide: vi.fn(async () => ({ kind: 'final', content })),
       }));
       // Settle both requests before releasing either connection, even on failure.
@@ -294,6 +296,8 @@ describe('real PostgreSQL persistence', () => {
           expect(d.decide).toHaveBeenCalledExactlyOnceWith({ ...created, status: 'running' });
         } else expect(d.decide).not.toHaveBeenCalled();
       });
+      const stepRows = (await client.query('SELECT step_no, result_kind FROM run_steps WHERE run_id=$1 ORDER BY step_no', [created.id])).rows;
+      expect(stepRows).toEqual([{ step_no: 1, result_kind: 'completed' }]);
       const stored = { ...created, status: 'completed' };
       expect(await createRunRepository(client).findRunById(created.id)).toEqual(stored);
       const app = buildApp({ repository: createRunRepository(client), logger: false });
@@ -301,7 +305,7 @@ describe('real PostgreSQL persistence', () => {
         const get = await app.inject(`/runs/${created.id}`);
         expect(get.statusCode).toBe(200);
         expect(get.json()).toEqual({ ...stored, createdAt: created.createdAt.toISOString() });
-        console.info(JSON.stringify({ runtimeBackendPids: pids.map(p => p.rows[0].pid), resultKinds: results.map(r => r?.kind), decisionCalls: 1, getStatus: get.statusCode, runStatus: get.json().status, fieldsPreserved: true }));
+        console.info(JSON.stringify({ runtimeBackendPids: pids.map(p => p.rows[0].pid), resultKinds: results.map(r => r?.kind), decisionCalls: 1, getStatus: get.statusCode, runStatus: get.json().status, fieldsPreserved: true, stepRows }));
       } finally { await app.close(); }
     } finally { connections.forEach(connection => connection.release()); }
   }, 15000);
@@ -325,8 +329,9 @@ describe('real PostgreSQL persistence', () => {
           ? { kind: 'final', content: 'MUST_NOT_RETURN' }
           : { kind: 'tool_request', toolName: 'must_not_execute', arguments: { secret: 'MUST_NOT_RETURN' } };
       });
-      expect(await runOneDecision(created.id, { repository, decide })).toEqual({ kind: 'finalize_conflict' });
+      expect(await runOneDecision(created.id, { repository, finalizer: createAtomicRunFinalizer({ connect: async () => ({ query: client.query.bind(client), release: () => {} }) }), decide })).toEqual({ kind: 'finalize_conflict' });
       // Assert outside decide so Runtime cannot turn an assertion failure into a source error.
+      expect((await client.query('SELECT * FROM run_steps WHERE run_id=$1', [created.id])).rows).toEqual([]);
       expect(externalWinner).toEqual({ ...created, status: outcome });
       expect(decide).toHaveBeenCalledTimes(1);
       expect(await repository.findRunById(created.id)).toEqual({ ...created, status: outcome });
@@ -349,10 +354,12 @@ describe('real PostgreSQL persistence', () => {
       if (state !== 'running') await repository.tryFinishRun(id, state);
     }
     const before = await repository.findRunById(id);
+    const stepsBefore = (await client.query('SELECT * FROM run_steps WHERE run_id=$1', [id])).rows;
     const decide = vi.fn(async () => ({ kind: 'final', content: 'not called' }));
-    expect(await runOneDecision(id, { repository, decide })).toEqual({ kind: 'not_started' });
+    expect(await runOneDecision(id, { repository, finalizer: createAtomicRunFinalizer({ connect: async () => ({ query: client.query.bind(client), release: () => {} }) }), decide })).toEqual({ kind: 'not_started' });
     expect(decide).not.toHaveBeenCalled();
     expect(await repository.findRunById(id)).toEqual(before);
+    expect((await client.query('SELECT * FROM run_steps WHERE run_id=$1', [id])).rows).toEqual(stepsBefore);
   });
 
   // Deliberately bypass repository validation to exercise PostgreSQL constraints.
