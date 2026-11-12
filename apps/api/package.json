@@ -13,6 +13,7 @@
   "dependencies": {
     "fastify": "5.12.8",
     "pg": "8.23.1",
-    "@axiom/contracts": "0.0.0"
+    "@axiom/contracts": "0.0.0",
+    "zod": "4.6.7"
   }
 }
