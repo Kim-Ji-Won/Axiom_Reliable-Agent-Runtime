@@ -312,6 +312,8 @@ describe('real PostgreSQL bounded decisions', () => {
   }));
 
   it('adds only the fifth constraint extension, preserves old data, safely downs and reapplies', async () => withSchema(async ({ schema, client, db }) => {
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(7);
+    await migrate('test', 'down', schema); // safe result table
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(6);
     await migrate('test', 'down', schema); // tool Step kinds; exercise migration five below
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(5);
@@ -321,24 +323,27 @@ describe('real PostgreSQL bounded decisions', () => {
     for (const kind of ['completed', 'unsupported_tool_request', 'invalid_decision', 'decision_source_error', 'finalize_conflict'] as const) await steps.appendRunStep(created.id, kind);
     const before = await snapshot(client);
     const columns = (await client.query("SELECT table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name IN ('runs','run_steps') ORDER BY table_name,ordinal_position", [schema])).rows;
-    expect(await migrate('test', 'up', schema)).toHaveLength(2);
+    expect(await migrate('test', 'up', schema)).toHaveLength(3);
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
     const after = await snapshot(client);
     expect(after.runs).toEqual(before.runs); expect(after.steps).toEqual(before.steps);
     expect(after.history.slice(0, 4)).toEqual(before.history);
-    expect(after.constraints.filter(c => c.conname !== 'run_steps_result_kind_check')).toEqual(before.constraints.filter(c => c.conname !== 'run_steps_result_kind_check'));
+    expect(after.constraints.filter(c => c.conname === 'run_steps_result_binding')).toEqual([{ conname: 'run_steps_result_binding', definition: 'UNIQUE (run_id, step_no, result_kind)' }]);
+    expect(after.constraints.filter(c => !['run_steps_result_kind_check', 'run_steps_result_binding'].includes(c.conname))).toEqual(before.constraints.filter(c => !['run_steps_result_kind_check', 'run_steps_result_binding'].includes(c.conname)));
     expect((await client.query("SELECT table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name IN ('runs','run_steps') ORDER BY table_name,ordinal_position", [schema])).rows).toEqual(columns);
+    expect(await migrate('test', 'down', schema)).toHaveLength(1); // safe result table
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // tool Step kinds
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // loop Step kinds
     expect(await snapshot(client)).toEqual(before);
     for (const kind of ['continued', 'decision_limit_exceeded', 'unknown']) {
       await expect(client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,6,$2)', [created.id, kind])).rejects.toMatchObject({ code: '23514' });
     }
-    expect(await migrate('test', 'up', schema)).toHaveLength(2);
+    expect(await migrate('test', 'up', schema)).toHaveLength(3);
     await expect(client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,6,'unknown')", [created.id])).rejects.toMatchObject({ code: '23514' });
   }));
 
   it.each(['continued', 'decision_limit_exceeded'] as const)('refuses down with %s preserving data, constraints and full migration history', async kind => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // safe result table
     await migrate('test', 'down', schema); // exercise migration five's guard
     const repo = createRunRepository(client); const created = await repo.createRun('preserve new kind'); await repo.tryStartRun(created.id);
     if (kind === 'continued') await createRunContinueRecorder(db).appendContinuedStepIfRunning(created.id);
@@ -346,11 +351,12 @@ describe('real PostgreSQL bounded decisions', () => {
     const before = await snapshot(client);
     await expect(migrate('test', 'down', schema)).rejects.toThrow('Cannot remove recorded loop Step kinds');
     expect(await snapshot(client)).toEqual(before);
-    expect(await migrate('test', 'up', schema)).toHaveLength(1); // restore migration six
+    expect(await migrate('test', 'up', schema)).toHaveLength(2); // restore migrations six and seven
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
   }));
 
   it('locks before down checks and refuses a concurrently committed new Step', async () => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // safe result table
     await migrate('test', 'down', schema); // exercise migration five's lock/guard
     const created = await createRunRepository(client).createRun('migration race');
     const writer = await db.connect(); let downgrade: Promise<{ error?: unknown }> | undefined;
