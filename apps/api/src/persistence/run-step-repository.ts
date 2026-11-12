@@ -1,10 +1,12 @@
 import { InvalidRunInputError, runIdSchema } from '@axiom/contracts';
 import type { PoolClient, QueryResultRow } from 'pg';
 
-export const runStepResultKinds = [
+export const appendRunStepResultKinds = [
   'completed', 'unsupported_tool_request', 'invalid_decision',
   'decision_source_error', 'finalize_conflict',
 ] as const;
+export const runStepResultKinds = [...appendRunStepResultKinds, 'continued', 'decision_limit_exceeded'] as const;
+export type AppendRunStepResultKind = typeof appendRunStepResultKinds[number];
 export type RunStepResultKind = typeof runStepResultKinds[number];
 
 export interface RunStep {
@@ -40,9 +42,9 @@ function toStep(row: StepRow): RunStep {
 
 export function createRunStepRepository(db: StepDatabase) {
   return {
-    async appendRunStep(runId: string, resultKind: RunStepResultKind): Promise<RunStep | null> {
+    async appendRunStep(runId: string, resultKind: AppendRunStepResultKind): Promise<RunStep | null> {
       validateId(runId);
-      if (!validKind(resultKind)) throw new InvalidRunInputError('Invalid Run Step result kind');
+      if (!appendRunStepResultKinds.some(kind => kind === resultKind)) throw new InvalidRunInputError('Invalid Run Step result kind');
       const client = await db.connect();
       let discard = false;
       try {

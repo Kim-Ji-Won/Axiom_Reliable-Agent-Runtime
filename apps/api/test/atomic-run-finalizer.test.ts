@@ -27,7 +27,7 @@ describe('atomic Run finalizer', () => {
     await expect(finalizer.tryFinalizeWithStep(invalid as string, 'completed')).rejects.toThrow('Invalid Run ID or finalization result kind');
     expect(connect).not.toHaveBeenCalled();
   });
-  it.each(['not_started', 'finalize_conflict', 'failed', '', 'SECRET_SENTINEL', null, {}, 1, undefined])('rejects result kind %# without input exposure or DB access', async kind => {
+  it.each(['continued', 'not_started', 'finalize_conflict', 'failed', '', 'SECRET_SENTINEL', null, {}, 1, undefined])('rejects result kind %# without input exposure or DB access', async kind => {
     const { finalizer, connect } = setup();
     const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map(method => vi.spyOn(console, method));
     await expect(finalizer.tryFinalizeWithStep(id, kind as FinalizationResultKind)).rejects.toThrow('Invalid Run ID or finalization result kind');

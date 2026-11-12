@@ -3,7 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 import { describe, expect, it } from 'vitest';
 import { createDatabase } from '../../src/persistence/database.js';
 import { createRunRepository } from '../../src/persistence/run-repository.js';
-import { createRunStepRepository, runStepResultKinds } from '../../src/persistence/run-step-repository.js';
+import { createRunStepRepository, appendRunStepResultKinds } from '../../src/persistence/run-step-repository.js';
 import { assertDatabaseIdentity, readDatabaseUrl } from '../../../../db/connection.js';
 import { migrate } from '../../../../db/migrate.js';
 
@@ -52,7 +52,8 @@ async function snapshot(client: PoolClient) {
 
 describe('real PostgreSQL Run Step history', () => {
   it('adds migration four without changing Runs, downgrades empty history and reapplies', async () => withSchema(async ({ schema, client }) => {
-    expect(await migrate('test', 'down', schema)).toHaveLength(1);
+    expect(await migrate('test', 'down', schema)).toHaveLength(1); // loop Step kinds
+    expect(await migrate('test', 'down', schema)).toHaveLength(1); // Step table
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(3);
     const runs = createRunRepository(client);
     const queued = await runs.createRun('preserve existing queued');
@@ -65,7 +66,7 @@ describe('real PostgreSQL Run Step history', () => {
       columns: (await client.query("SELECT column_name, column_default, is_nullable FROM information_schema.columns WHERE table_schema=$1 AND table_name='runs' ORDER BY ordinal_position", [schema])).rows,
     });
     const definition = await runDefinition();
-    expect(await migrate('test', 'up', schema)).toHaveLength(1);
+    expect(await migrate('test', 'up', schema)).toHaveLength(2);
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
     expect(await runDefinition()).toEqual(definition);
     const columns = (await client.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='run_steps' ORDER BY ordinal_position", [schema])).rows;
@@ -74,14 +75,15 @@ describe('real PostgreSQL Run Step history', () => {
     expect(constraints.some(c => c.contype === 'p')).toBe(true);
     expect(constraints.filter(c => c.contype === 'c')).toHaveLength(2);
     expect(constraints.find(c => c.contype === 'f').confdeltype).toBe('a');
-    expect(await migrate('test', 'down', schema)).toHaveLength(1);
+    expect(await migrate('test', 'down', schema)).toHaveLength(1); // loop Step kinds
+    expect(await migrate('test', 'down', schema)).toHaveLength(1); // Step table
     expect((await client.query("SELECT to_regclass('run_steps') AS name")).rows[0].name).toBeNull();
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(3);
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
     expect(await runDefinition()).toEqual(definition);
     expect((await runs.createRun('default remains')).status).toBe('queued');
     expect(await runs.findRunById(queued.id)).toEqual(queued);
-    expect(await migrate('test', 'up', schema)).toHaveLength(1);
+    expect(await migrate('test', 'up', schema)).toHaveLength(2);
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
   }));
 
@@ -95,7 +97,7 @@ describe('real PostgreSQL Run Step history', () => {
     expect(await repo.appendRunStep(missing, 'completed')).toBeNull();
     const before = (await client.query('SELECT clock_timestamp() AS time')).rows[0].time as Date;
     const steps = [];
-    for (const kind of runStepResultKinds) steps.push(await repo.appendRunStep(run.id, kind));
+    for (const kind of appendRunStepResultKinds) steps.push(await repo.appendRunStep(run.id, kind));
     const after = (await client.query('SELECT clock_timestamp() AS time')).rows[0].time as Date;
     expect(steps.map(step => step!.stepNo)).toEqual([1, 2, 3, 4, 5]);
     steps.forEach(step => {
@@ -175,16 +177,18 @@ describe('real PostgreSQL Run Step history', () => {
   }));
 
   it('refuses nonempty down without changing rows, constraints or migration history', async () => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // test the original Step-table downgrade
     const run = await createRunRepository(client).createRun('preserve history');
     await createRunStepRepository(db).appendRunStep(run.id, 'completed');
     const before = await snapshot(client);
     await expect(migrate('test', 'down', schema)).rejects.toThrow('Cannot drop nonempty run_steps');
     expect(await snapshot(client)).toEqual(before);
-    expect(await migrate('test', 'up', schema)).toHaveLength(0);
+    expect(await migrate('test', 'up', schema)).toHaveLength(1);
     expect((await createRunStepRepository(db).appendRunStep(run.id, 'completed'))!.stepNo).toBe(2);
   }));
 
   it('waits for an in-flight INSERT before checking whether down can drop the table', async () => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // test the original Step-table downgrade
     const run = await createRunRepository(client).createRun('down versus insert');
     const writer = await db.connect();
     let downgrade: Promise<{ error?: unknown }> | undefined;

@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P1-F — Atomic Runtime Finalization + Step History 구현·검토 중. P0-A1~A4 및 P1-A~E 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 자동 실행이나 에이전트 실행 루프는 아직 구현하지 않았습니다.
+**현재 단계: P1-G — Bounded Decision Loop 구현·검토 중. P0-A1~A4 및 P1-A~F 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot orchestration, Step metadata 저장소와 종료·기록의 원자적 결합까지입니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -60,17 +60,19 @@ Axiom/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
-│   │   ├── persistence/        # DB pool, Run/Step repository 및 atomic-run-finalizer.ts
-│   │   └── runtime/            # run-one-decision.ts; 내부 단일 결정 실행
+│   │   ├── persistence/        # DB pool, Run/Step, atomic finalizer, continue recorder
+│   │   └── runtime/            # run-one-decision.ts / run-bounded-decisions.ts
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
 │   │   ├── run-step-repository.test.ts # Step 입력·반환·연결 정리 경계
 │   │   ├── atomic-run-finalizer.test.ts # 종료·Step 트랜잭션 및 실패 경계
+│   │   ├── bounded-runtime.test.ts # 실행 예산·순서·중단 경계
+│   │   ├── run-continue-recorder.test.ts # continued 트랜잭션·연결 정리
 │   │   ├── runtime.test.ts     # claim·결정·종료 및 오류 경계
 │   │   ├── model-decision.test.ts # 모델 결정·JSON 안전성 및 경계 검증
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
-│   │   └── db/                # runs/run-steps/atomic-finalization.test.ts, process-fixture.ts
+│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime.test.ts, process-fixture.ts
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
@@ -217,11 +219,14 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 `@axiom/contracts`는 `modelDecisionSchema`, `parseModelDecision(raw: unknown)`, 공유 타입 `ModelDecision`·`JsonObject`를 제공합니다. 두 진입점 모두 동일한 안전성 검증을 수행합니다.
 
 ```ts
+{ kind: 'continue' }
 { kind: 'final', content: '분석 결과입니다.' }
 { kind: 'tool_request', toolName: 'search_documents', arguments: { query: 'PostgreSQL' } }
 ```
 
-`final.content`는 원문을 보존하며 1~4000 Unicode code points, 비공백 텍스트만 허용합니다. NUL과 짝이 맞지 않는 surrogate를 거부합니다. `toolName`은 소문자로 시작하는 1~64자의 소문자·숫자·`_`·`-`입니다. 두 variant 모두 추가 필드와 암묵적 타입 변환을 거부합니다.
+`continue`는 다음 결정을 요청하는 내부 제어 신호이며 `kind` 외 속성을 허용하지 않습니다. 외부 행동의 권한이나 사용자 승인을 부여하지 않습니다.
+
+`final.content`는 원문을 보존하며 1~4000 Unicode code points, 비공백 텍스트만 허용합니다. NUL과 짝이 맞지 않는 surrogate를 거부합니다. `toolName`은 소문자로 시작하는 1~64자의 소문자·숫자·`_`·`-`입니다. 세 variant 모두 추가 필드와 암묵적 타입 변환을 거부합니다.
 
 `arguments`는 JSON 객체이며 루트 객체를 깊이 1로 세고 중첩 객체·배열은 최대 깊이 8까지 허용합니다. 공백 없는 `JSON.stringify(arguments)` 형식의 UTF-8 크기는 최대 8192 bytes입니다. 키·구분자·escape·반복 참조의 직렬화 크기도 포함합니다. 검증은 객체의 getter나 `toJSON`을 실행하지 않고 data property를 검사하며 문자열·유한 숫자·boolean·null·배열·객체를 보존합니다.
 
@@ -229,7 +234,7 @@ Node.js의 `util.types.isProxy`로 Proxy를 탐지해 trap 실행 전에 거부�
 
 `parseModelDecision`은 실패 시 Run 입력 오류와 별개의 `InvalidModelDecisionError`를 던집니다. 스키마는 Zod 오류를 반환하며, 실패 입력은 오류 생성 전에 제거해 `reportInput` 옵션에서도 원문·인자·비밀정보가 담기지 않도록 합니다. 검증된 인자는 복사·freeze하지 않으므로 호출자는 검증 후 입력을 변경하지 않고 사용해야 합니다.
 
-**A model request is not execution authorization.** `tool_request`는 모델의 도구 요청 제안이며 실행 승인은 별도 Runtime 정책의 책임입니다. `final`도 최종 텍스트 제안입니다. P1-C는 결정 계약과 입력 검증까지 구현하며, 모델 호출·provider adapter·권한 정책·실제 도구 실행·Run 자동 전이·실행 루프는 후속 단계입니다.
+**A model request is not execution authorization.** `tool_request`는 모델의 도구 요청 제안이며 실행 승인은 별도 Runtime 정책의 책임입니다. `final`도 최종 텍스트 제안입니다. P1-C는 결정 계약과 입력 검증을 담당합니다. 내부 실행 제어는 아래 Runtime에 있으며 모델 호출·provider adapter·권한 정책·실제 도구 실행은 후속 단계입니다.
 
 ### One-Shot Runtime · 단일 결정 실행 (P1-D 완료)
 
@@ -244,6 +249,7 @@ queued → 원자적 claim → running → decide 1회 → parseModelDecision �
 | 미존재·이미 running·종료 Run | 없음, decide 호출 없음 | `not_started` |
 | 유효한 final | completed | 종료 성공 시에만 `completed`와 원문 `content` |
 | 유효한 tool_request | failed | `unsupported_tool_request` |
+| 유효한 continue (one-shot) | failed | `decision_limit_exceeded`, decide는 여전히 1회 |
 | 계약 위반 | failed | `invalid_decision` |
 | 결정 함수 throw/reject | failed | `decision_source_error` |
 | 어떤 종료 시도든 null 반환 | 추가 조회·재시도 없음 | `finalize_conflict` |
@@ -264,22 +270,22 @@ queued → 원자적 claim → running → decide 1회 → parseModelDecision �
 | --- | --- |
 | `run_id` | UUID, NOT NULL, runs(id) FK; 자동 CASCADE 삭제 없음 |
 | `step_no` | INTEGER, 양수, run_id와 복합 PK |
-| `result_kind` | TEXT, NOT NULL, 아래 다섯 값의 CHECK |
+| `result_kind` | TEXT, NOT NULL, 현재 일곱 값의 CHECK (다섯 번째 migration 포함) |
 | `created_at` | TIMESTAMPTZ, NOT NULL, DB의 NOW() 기본값 |
 
-허용 결과는 `completed`, `unsupported_tool_request`, `invalid_decision`, `decision_source_error`, `finalize_conflict`입니다. `not_started`는 기록하지 않습니다. 사용자 task, final content, 모델 원문, 도구 이름·인자, 예외 상세와 자격증명을 저장할 컬럼은 없습니다. UUID와 결과 종류는 연결을 얻기 전에 검증하고 입력 오류에는 원문을 담지 않습니다. DB 오류는 호출자에게 전달하며 저장소 자체에서 로그를 남기지 않습니다.
+조회 가능한 결과는 `completed`, `unsupported_tool_request`, `invalid_decision`, `decision_source_error`, `finalize_conflict`, `continued`, `decision_limit_exceeded`입니다. 기존 일반 `appendRunStep()`은 앞의 다섯 종류만 받습니다. `continued`는 아래 Continue Recorder에서만, `decision_limit_exceeded`는 Atomic Finalizer에서 failed 종료와 함께 기록합니다. `not_started`는 기록하지 않습니다. 사용자 task, final content, 모델 원문, 도구 이름·인자, 예외 상세와 자격증명을 저장할 컬럼은 없습니다. UUID와 결과 종류는 연결을 얻기 전에 검증하고 입력 오류에는 원문을 담지 않습니다. DB 오류는 호출자에게 전달하며 저장소 자체에서 로그를 남기지 않습니다.
 
 Append마다 pool에서 전용 연결을 빌려 `BEGIN ISOLATION LEVEL READ COMMITTED → runs 부모 행 SELECT FOR UPDATE → MAX(step_no)+1 INSERT → COMMIT`을 수행합니다. 부모 잠금을 얻은 뒤 별도 SQL에서 새 snapshot으로 다음 순번을 계산하므로 지원되는 append 경로에서는 같은 Run의 동시 요청이 1, 2로 기록됩니다. 다른 Run의 번호는 독립적입니다. 실패하면 같은 연결에서 ROLLBACK하고 연결을 반환하며 rollback도 실패하면 연결을 폐기합니다. Pool 자체의 종료 책임은 호출자에게 있습니다. 이미 트랜잭션 중인 공유 client를 연결 제공자로 전달하는 방식은 지원하지 않습니다.
 
 이력 순서는 timestamp가 아닌 `step_no`로 판단합니다. 순번 보장은 이 repository의 append 경로에 한정하며 외부 SQL 수정·삭제까지 통제하지 않습니다. INTEGER 범위를 넘으면 DB 오류가 발생하고 재시도하지 않습니다. COMMIT 중 연결 장애는 결과가 불확실할 수 있으므로 자동 retry나 exactly-once를 보장하지 않습니다.
 
-새 migration의 down은 runner의 단일 트랜잭션 안에서 `run_steps`를 ACCESS EXCLUSIVE로 잠근 뒤 행 존재를 검사합니다. 빈 테이블만 제거하고 세 migration 상태로 복귀합니다. 이력이 있으면 오류로 중단하여 Step·Run 데이터, 제약과 migration 이력을 보존합니다. 기존 임시 테스트 schema 전용 rollback 제한을 유지합니다.
+네 번째 migration의 down은 runner의 단일 트랜잭션 안에서 `run_steps`를 ACCESS EXCLUSIVE로 잠근 뒤 행 존재를 검사합니다. 빈 테이블만 제거하고 세 migration 상태로 복귀합니다. 이력이 있으면 오류로 중단하여 Step·Run 데이터, 제약과 migration 이력을 보존합니다. 기존 임시 테스트 schema 전용 rollback 제한을 유지합니다.
 
 독립 `appendRunStep()`은 Run 상태를 변경하지 않습니다. 이 저장소는 외부 SQL 변경을 통제하는 감사 원장이 아닙니다. Runtime의 종료와 기록 결합은 아래 P1-F의 별도 finalizer를 사용합니다.
 
-### Atomic Runtime Finalization · 종료와 Step 기록 (P1-F 구현·검토 중)
+### Atomic Runtime Finalization · 종료와 Step 기록 (P1-F 완료)
 
-`createAtomicRunFinalizer(pool).tryFinalizeWithStep(runId, resultKind)`는 성공 시 `{ run, step }`, 미존재·queued·종료된 Run이면 `null`을 반환합니다. UUID와 아래 네 resultKind만 연결 획득 전에 검증하며 상태는 내부에서 결정합니다.
+`createAtomicRunFinalizer(pool).tryFinalizeWithStep(runId, resultKind)`는 성공 시 `{ run, step }`, 미존재·queued·종료된 Run이면 `null`을 반환합니다. UUID와 아래 다섯 종료 resultKind만 연결 획득 전에 검증하며 상태는 내부에서 결정합니다.
 
 | Runtime 결과 | Run 상태 | 저장 Step |
 | --- | --- | --- |
@@ -287,6 +293,7 @@ Append마다 pool에서 전용 연결을 빌려 `BEGIN ISOLATION LEVEL READ COMM
 | unsupported_tool_request | failed | unsupported_tool_request |
 | invalid_decision | failed | invalid_decision |
 | decision_source_error | failed | decision_source_error |
+| decision_limit_exceeded | failed | decision_limit_exceeded |
 | not_started | 변경 없음 | 기록 없음 |
 | finalize_conflict | 외부 승자 유지 | 추가 기록 없음 |
 
@@ -296,7 +303,31 @@ Append마다 pool에서 전용 연결을 빌려 `BEGIN ISOLATION LEVEL READ COMM
 
 INSERT 및 확정적인 COMMIT 실패에서는 Run UPDATE와 Step INSERT를 함께 rollback하고 DB 오류를 호출자에게 전달합니다. rollback 실패 연결은 폐기하며 모든 COMMIT 오류 연결도 보수적으로 폐기합니다. COMMIT 중 연결 단절은 실제 반영 여부가 불확실할 수 있고 자동 재시도하지 않습니다. 호출자는 전달된 DB 오류의 상세를 외부에 노출하지 않아야 하며 pool 수명도 관리합니다.
 
-원자적 범위는 **종료 상태 + 결과 Step 한 건**입니다. 시작·decide·종료 전체가 하나의 트랜잭션은 아니며 프로세스 장애나 DB 오류 뒤 running이 남을 수 있습니다. 기존 direct `tryFinishRun()`은 Step을 자동 기록하지 않고 별도 `appendRunStep()`도 종료를 의미하지 않습니다. 순번은 지원되는 부모 잠금 경로에서만 보장합니다. Durable/Exactly-Once, retry, recovery, 실제 모델·도구 실행은 보장하거나 구현하지 않습니다. P1-F는 아직 병합 전 검토 단계입니다.
+원자적 범위는 **종료 상태 + 결과 Step 한 건**입니다. 시작·decide·종료 전체가 하나의 트랜잭션은 아니며 프로세스 장애나 DB 오류 뒤 running이 남을 수 있습니다. 기존 direct `tryFinishRun()`은 Step을 자동 기록하지 않고 별도 `appendRunStep()`도 종료를 의미하지 않습니다. 순번은 지원되는 부모 잠금 경로에서만 보장합니다. Durable/Exactly-Once, retry, recovery, 실제 모델·도구 실행은 보장하거나 구현하지 않습니다. P1-F는 병합 완료됐습니다. `continued`는 종료 입력으로 거부합니다.
+
+### Bounded Decision Loop · 제한된 내부 반복 (P1-G 구현·검토 중)
+
+`runBoundedDecisions(runId, { repository, finalizer, continueRecorder, decide }, { maxDecisions })`는 `run-one-decision.ts`와 별도의 내부 API입니다. `maxDecisions`는 필수 정수 **1~5**이며 잘못된 값이나 필수 의존성 누락은 claim·DB 접근·decide 전에 고정 오류로 거부합니다. claim은 한 번만 시도하고, 실패하면 `not_started`로 반환하며 Step을 쓰지 않습니다.
+
+```text
+claim → running → decide → 검증
+  continue + 예산 남음 → continued COMMIT → 상태 재확인 → 다음 decide
+  continue + 예산 소진 → failed + decision_limit_exceeded 원자적 COMMIT
+  final → completed + completed Step 원자적 COMMIT → content 반환
+  tool_request / invalid / source error → failed + 해당 Step 원자적 COMMIT
+```
+
+각 결정은 순차 처리하며 Step은 최대 한 건만 추가합니다. 예산 3에서 세 번 `continue`하면 이력은 `continued → continued → decision_limit_exceeded`이고 decide는 정확히 3회입니다. 마지막 결정에 continued를 중복 기록하지 않습니다. 기존 `runOneDecision()`도 계속 제공하며 continue이면 추가 decide 없이 limit 실패 Step 한 건을 기록합니다.
+
+`createRunContinueRecorder(pool).appendContinuedStepIfRunning(runId)`는 UUID 검증 후 전용 idle connection에서 `BEGIN READ COMMITTED → SELECT runs FOR UPDATE → running 확인 → 별도 INSERT MAX(step_no)+1 → COMMIT`을 수행합니다. Run 상태를 바꾸지 않고 Step metadata만 기록합니다. Atomic Finalizer는 종료 상태와 종료 Step 한 건을 함께 확정합니다. 두 연산은 일반 append 및 direct finish와 같은 부모 잠금을 사용합니다. 미존재·비running이면 recorder는 null, Runtime은 `finalize_conflict`로 중단합니다. 기존 COMMIT 이력과 외부 종료 승자 상태를 유지하며 재시도하지 않습니다.
+
+다음 decide 전에는 `findRunById()`로 상태를 다시 읽고 종료를 관찰했다면 호출하지 않습니다. 이 조회는 실행 lease가 아니므로 조회 직후 다른 연결이 종료할 가능성까지 제거하지는 않습니다. 그 경우에도 recorder/finalizer가 잠금 아래 상태를 다시 검사하여 종료 후 continued나 추가 종료 Step을 기록하지 않습니다. decide 동안 장시간 DB 잠금을 유지하지 않습니다.
+
+모델·도구 provider, registry, 네트워크 및 새 HTTP 경로는 연결하지 않았습니다. continue와 tool_request는 실행 권한이 아닙니다. final content는 종료 COMMIT 후 호출자에게만 반환하고 모델 원문·tool 이름/인자·예외·자격증명은 Step이나 Runtime 실패 결과에 넣지 않습니다. DB 오류는 원래 오류로 reject되므로 호출자는 상세를 외부에 노출하지 않아야 합니다.
+
+Continue INSERT 실패는 rollback하며 COMMIT 오류와 rollback 실패 연결은 폐기합니다. 이미 확정된 continued 이력은 유지합니다. COMMIT 응답 손실은 반영 여부가 불확실할 수 있으며 자동 retry하지 않습니다. 이 루프는 **한 프로세스 호출 내 결정 횟수**만 제한합니다. 프로세스 재시작 후 예산 복구, running 잔류 복구, timeout/cancellation, Durable/Exactly-Once를 보장하지 않습니다. 주입된 decide는 신뢰 코드이며 함수 자체의 부작용이나 응답 대기 시간을 격리하지 않습니다.
+
+다섯 번째 migration `1794480000000-allow-loop-step-results.cjs`는 result-kind CHECK만 확장합니다. 기존 Run/Step, PK·FK·시각·순번은 보존합니다. down은 단일 트랜잭션에서 `ACCESS EXCLUSIVE` 잠금을 먼저 얻고 신규 두 kind가 없는 경우에만 이전 다섯 종류 CHECK를 복원합니다. 신규 kind 행이 하나라도 있으면 데이터·제약·migration 이력을 유지하며 거부합니다. 기존 임시 테스트 schema 전용 rollback 보호도 유지합니다.
 
 ### Migrations & Test Isolation
 
@@ -306,7 +337,7 @@ INSERT 및 확정적인 COMMIT 실패에서는 Run UPDATE와 Step INSERT를 함�
 
 새 `1793966400000-allow-finished-runs.cjs`는 네 상태를 허용하며 기존 queued/running 행을 보존합니다. 이 migration의 down은 종료 행이 없을 때 queued/running 제약으로 돌아갑니다. completed 또는 failed 행이 있으면 데이터·현재 제약·migration 이력을 바꾸지 않고 실패합니다. 개발 DB에 자동 적용하지 않습니다.
 
-`npm run test:db`는 세 DB 테스트 파일을 순차 실행합니다(migration 전역 잠금의 경합 방지). DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, 독립 연결의 동시 시작·동시 종료·최종 상태 GET·rollback 성공 및 거부, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
+`npm run test:db`는 네 DB 테스트 파일을 순차 실행합니다(migration 전역 잠금의 경합 방지). DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, 독립 연결의 동시 시작·동시 종료·최종 상태 GET·rollback 성공 및 거부, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
 
 첫 migration의 rollback은 테이블 데이터를 삭제하므로 제공된 실행기에서는 임시 테스트 스키마에만 허용합니다. 개발 DB 초기화나 자동 rollback 명령은 제공하지 않습니다. 첫 SQL migration 자체의 `down`은 파괴적이므로 별도 도구로 직접 실행할 때 주의해야 합니다.
 
@@ -345,19 +376,19 @@ npm run test:db  # PostgreSQL 테스트 컨테이너가 필요합니다.
 | --- | --- |
 | `npm run typecheck` | 소스와 테스트의 TypeScript 타입 검사 |
 | `npm run build` | contracts 패키지와 서버의 JavaScript 빌드 |
-| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot Runtime·Step repository 검증 (DB 불필요) |
-| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 재시작 영속성, Runtime 동시 claim·종료 경합, Step 동시 append·실패 rollback·안전한 down |
+| `npm test` | HTTP 계약·오류·pool 종료, health regression, task 입력·DB 대상·모델 결정 계약·one-shot/bounded Runtime·Step repository·Continue Recorder 검증 (DB 불필요) |
+| `npm run test:db` | 실제 PostgreSQL HTTP POST→GET, migration, repository, constraint, pool 종료, API 재시작 영속성, Runtime 동시 claim·종료 경합, Step 동시 append·bounded 실행·종료 경합·INSERT/COMMIT 실패 rollback·안전한 down |
 
 health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 않습니다. 각 테스트의 앱 인스턴스는 종료 후 정리합니다. 실제 서버 기동과 SIGINT/SIGTERM 종료 신호는 A3에서 별도로 검증했습니다. A4 DB 테스트는 서로 다른 프로세스가 실제 loopback 포트에서 HTTP를 처리하고 정상 종료하는 흐름을 추가합니다.
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A~E는 완료됐으며 P1-F는 Atomic Runtime Finalization + Step History 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4와 P1-A~F는 완료됐으며 P1-G는 Bounded Decision Loop 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
-| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~E 완료; P1-F Atomic Runtime Finalization + Step History 구현·검토 중; 나머지 예정 |
+| P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~F 완료; P1-G Bounded Decision Loop 구현·검토 중; 나머지 예정 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
