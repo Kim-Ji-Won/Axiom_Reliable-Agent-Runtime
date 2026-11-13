@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P2-D — Run-Aware Bounded Tool Loop 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A~C 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
+**현재 단계: P2-E — Privacy-Gated Tool Result Persistence 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A~D 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight·실행 결과 데이터 계약과 신뢰된 순수 Handler를 위한 내부 In-Memory Executor와 선택적으로 호출하는 Run-Aware Tool Loop까지입니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight·실행 결과 데이터 계약과 신뢰된 순수 Handler를 위한 내부 In-Memory Executor와 선택적으로 호출하는 Run-Aware Tool Loop 및 별도 내부 API의 제한된 Safe Result 저장까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -60,9 +60,9 @@ Axiom/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
-│   │   ├── persistence/        # DB pool, Run/Step, atomic finalizer, continue/tool recorder
+│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result repository
 │   │   ├── runtime/            # one-shot / bounded / bounded-tool decisions
-│   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / In-Memory Executor
+│   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / Executor / Result Policy
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
@@ -70,6 +70,8 @@ Axiom/
 │   │   ├── atomic-run-finalizer.test.ts # 종료·Step 트랜잭션 및 실패 경계
 │   │   ├── bounded-runtime.test.ts # 기존 실행 예산·순서·중단 경계
 │   │   ├── bounded-tool-runtime.test.ts # Tool 예산·context·외부 종료·보안 경계
+│   │   ├── tool-result-policy.test.ts # Strict Safe Result·허용 목록·hostile input
+│   │   ├── run-tool-result-repository.test.ts # 원자적 저장·조회·만료·실패
 │   │   ├── run-tool-step-recorder.test.ts # Tool Step COMMIT·연결 정리
 │   │   ├── run-continue-recorder.test.ts # continued 트랜잭션·연결 정리
 │   │   ├── runtime.test.ts     # claim·결정·종료 및 오류 경계
@@ -80,7 +82,7 @@ Axiom/
 │   │   ├── tool-execution-outcome.test.ts # strict 결과 계약·output snapshot·오류 비노출
 │   │   ├── in-memory-tool-executor.test.ts # Default Deny·Gate·Handler·출력 및 I/O 경계
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
-│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime.test.ts, process-fixture.ts
+│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results.test.ts, process-fixture.ts
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
@@ -345,7 +347,7 @@ Continue INSERT 실패는 rollback하며 COMMIT 오류와 rollback 실패 연결
 
 새 `1793966400000-allow-finished-runs.cjs`는 네 상태를 허용하며 기존 queued/running 행을 보존합니다. 이 migration의 down은 종료 행이 없을 때 queued/running 제약으로 돌아갑니다. completed 또는 failed 행이 있으면 데이터·현재 제약·migration 이력을 바꾸지 않고 실패합니다. 개발 DB에 자동 적용하지 않습니다.
 
-`npm run test:db`는 다섯 DB 테스트 파일을 순차 실행합니다(migration 전역 잠금의 경합 방지). DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, 독립 연결의 동시 시작·동시 종료·최종 상태 GET·rollback 성공 및 거부, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
+`npm run test:db`는 여섯 DB 테스트 파일을 순차 실행합니다(migration 전역 잠금의 경합 방지). DB 이름이 정확히 `axiom_test`인지 확인한 뒤 실행별 임시 스키마를 만듭니다. migration up → 재실행 → down → up, repository 저장·조회, 별도 Node 프로세스 간 영속성, API 프로세스 재시작 전후 실제 HTTP 응답 일치, 독립 연결의 동시 시작·동시 종료·최종 상태 GET·rollback 성공 및 거부, DB 제약을 검증하고 자신의 스키마만 삭제합니다. 테스트용 URL에 개발 DB를 지정하면 schema 생성 전에 실패합니다. 테스트 실패 시 DB 테스트를 자동 skip하지 않습니다.
 
 첫 migration의 rollback은 테이블 데이터를 삭제하므로 제공된 실행기에서는 임시 테스트 스키마에만 허용합니다. 개발 DB 초기화나 자동 rollback 명령은 제공하지 않습니다. 첫 SQL migration 자체의 `down`은 파괴적이므로 별도 도구로 직접 실행할 때 주의해야 합니다.
 
@@ -448,7 +450,7 @@ const outcome = await executor.execute('12345678-1234-4234-8234-123456789abc', {
 
 P2-C Executor 자체는 HTTP·기존 One-Shot/Bounded Runtime·DB·worker·Model Provider와 자동 연결되지 않습니다. 기존 Runtime은 계속 Tool Request를 `failed + unsupported_tool_request`로 종료합니다. 프로덕션 파일·네트워크·DB·shell·Browser·Plugin 도구, 결과 persistence 및 새 HTTP/migration은 없습니다. P2-C는 병합과 main 검증을 완료했습니다. 아래 P2-D는 선택적인 내부 실행 통합이며 실제 사용자 인증·승인·정책은 P4 범위입니다.
 
-## Run-Aware Tool Loop · 선택적 내부 실행 (P2-D 구현·검토 중)
+## Run-Aware Tool Loop · 선택적 내부 실행 (P2-D 완료)
 
 `runBoundedToolDecisions(runId, dependencies, { maxDecisions, maxToolExecutions })`는 별도 내부 API입니다. 기존 `runOneDecision()`과 `runBoundedDecisions()`는 여전히 Tool Request를 `failed + unsupported_tool_request`로 종료합니다. 새 Runtime도 HTTP·worker에서 자동 호출하지 않으며 실제 모델이나 외부 도구는 연결하지 않습니다.
 
@@ -476,7 +478,51 @@ Step은 계속 `run_id`, `step_no`, `result_kind`, `created_at` **metadata만** 
 
 **외부 종료 경합의 한계:** running 조회와 Handler 호출 사이에는 race window가 남습니다. Handler 시작 전에 종료를 관찰하면 호출 0회입니다. 실행 중 종료되면 이미 시작한 Handler는 취소할 수 없지만, guarded recorder/finalizer가 terminal 상태를 보존하고 허위 Tool Step·다음 결정을 차단합니다. 완료된 외부 Step을 덮어쓰지 않습니다. 순수 Handler만 사용하며 실제 side effect를 원자적으로 제어한다고 주장하지 않습니다.
 
-**A model request is not execution authorization.** 내부 Executor와 Decision Source는 신뢰된 호스트 의존성입니다. 정상 native Promise 및 런타임 내장 함수의 무결성을 전제로 하며, parser 성공은 실행 출처의 증명이 아닙니다. 사용자 인증·승인·Lease·임의 Handler Sandbox는 없고 Timeout·Cancellation·Recovery·Exactly-Once를 제공하지 않습니다. Tool 결과 영속화는 **P2-E**, durable/crash recovery는 **P3**, 사용자 승인·권한 정책은 **P4**에서 별도 설계합니다. P2-D는 아직 병합 전 구현·검토 상태입니다.
+**A model request is not execution authorization.** 내부 Executor와 Decision Source는 신뢰된 호스트 의존성입니다. 정상 native Promise 및 런타임 내장 함수의 무결성을 전제로 하며, parser 성공은 실행 출처의 증명이 아닙니다. 사용자 인증·승인·Lease·임의 Handler Sandbox는 없고 Timeout·Cancellation·Recovery·Exactly-Once를 제공하지 않습니다. P2-D는 병합과 main 검증을 완료했습니다. 아래 P2-E는 별도 내부 저장 API이며 이 Runtime에 자동 연결하지 않습니다. Durable/crash recovery는 **P3**, 사용자 승인·권한 정책은 **P4** 범위입니다.
+
+## Privacy-Gated Tool Results · 제한된 내부 저장 (P2-E 구현·검토 중)
+
+**Validation is not permission to persist.** 기본은 **Default No-Store**입니다. 기존 `runBoundedToolDecisions()`와 `appendToolSucceededStepIfRunning()`은 계속 Step metadata만 기록하며 Tool Output을 저장하지 않습니다. 새 저장소는 신뢰된 호스트 코드가 별도로 호출해야 합니다. 모델의 `approved`, `persist`, `save`, Handler 성공 및 Outcome 파싱 성공은 저장 권한이 아닙니다.
+
+`createToolResultPolicy()`의 기본 허용 목록은 비어 있습니다. 호스트가 Tool 이름, 순수·동기 `project(outcome)` 함수, 정수 `retentionSeconds`(1~86,400)를 명시적으로 등록합니다. 정책은 생성 시 복사·캡처하고 비공개 WeakMap의 객체 identity로 확인합니다. 구조가 같은 가짜 정책이나 정의 배열 변경으로 우회할 수 없습니다. 입력 Outcome은 기존 parser로 독립 복사·deep freeze한 뒤 Projector에 전달하고, Projector 결과도 재검증합니다. Promise/thenable·비정상 Projection은 저장하지 않습니다.
+
+저장 계약은 오직 다음 세 필드입니다. Coercion·default·transform·추가 필드·자유 문자열·임의 JSON을 허용하지 않습니다.
+
+| 필드 | 허용값 |
+| --- | --- |
+| `schemaVersion` | 정확히 `1` |
+| `status` | `ok` 또는 `empty` |
+| `itemCount` | 정수 0~1000 |
+
+Payload 상한은 UTF-8 **1,024 bytes**입니다. 이 고정 계약의 정상 값은 훨씬 작으며 경계값을 채우려고 padding을 허용하지 않습니다. Proxy·getter/setter·`toJSON`·순환·숨겨진 필드·Symbol·비JSON 값은 실행 없이 거부하고 독립 동결 snapshot을 반환합니다. 임의 문자열, 사용자 Task, Tool arguments/raw output, Model/Final Content, Error/Cause/Stack, URL, Credential, Query Hash를 보존하지 않습니다. 민감정보 자동 탐지·Redaction 기능은 없으며 synthetic summary의 의미 검토는 신뢰된 호스트의 책임입니다.
+
+```ts
+const policy = createToolResultPolicy([{
+  name: 'synthetic_summary',
+  retentionSeconds: 3600,
+  project: () => ({ schemaVersion: 1, status: 'ok', itemCount: 3 }),
+}]);
+const results = createRunToolResultRepository(pool, policy);
+// Trusted internal host call; no Handler runs inside this transaction.
+await results.appendToolSucceededStepWithSafeResultIfRunning(runId, 'synthetic_summary', outcome);
+await results.getSavedToolResult(runId, stepNo);
+await results.deleteExpiredToolResults(); // Explicit maintenance; no background worker.
+```
+
+정책 미설정·미등록 Tool·유효하지 않은 Outcome/Projection은 고정 `{ kind: 'no_store' }`를 반환하며 연결·Step·Result를 만들지 않습니다. 잘못된 UUID/Step 번호는 연결 전에 거부합니다. 저장 가능한 입력이어도 Run이 없거나 queued/terminal이면 `null`이고 두 행 모두 추가하지 않습니다.
+
+새 Recorder는 전용 연결에서 `BEGIN READ COMMITTED → runs FOR UPDATE → running 확인 → 다음 번호의 tool_succeeded Step INSERT → Safe Result INSERT → COMMIT` 순서로 실행하고, 확인된 COMMIT 뒤에만 `{ step, result }`를 반환합니다. 기존 Recorder·Finalizer와 같은 부모 잠금 순서입니다. Handler를 호출하거나 실행 중 DB 잠금을 유지하지 않습니다. INSERT·제약 실패는 두 행 모두 rollback하며 COMMIT/rollback 오류 연결은 discard합니다. COMMIT 응답 유실 시 두 행이 이미 반영됐을 수 있어 자동 재시도·성공 추정·Handler 재호출을 하지 않습니다. DB 오류는 신뢰된 호출자에게 전파하며 자동 로깅하거나 모델 오류로 바꾸지 않습니다.
+
+**Migration #7:** `1794529800000-create-run-tool-results.cjs`는 기존 migration 1~6을 보존합니다. `run_tool_results`는 `run_id`, `step_no`, 고정 `result_kind`, `schema_version`, `status`, `item_count`, `created_at`, `expires_at`만 저장합니다. JSONB 대신 전용 typed columns를 사용하므로 자유 JSON을 담을 컬럼 자체가 없습니다. 확장은 새 migration·계약 리뷰가 필요합니다.
+
+- `(run_id, step_no)` PK로 Step당 결과 최대 1개입니다.
+- 기존 Step에 additive UNIQUE `(run_id, step_no, result_kind)`를 만들고 복합 FK와 고정 `tool_succeeded` CHECK로 정확한 Run/Step/종류 연결을 보장합니다. 기존 행을 재작성하거나 삭제하지 않습니다.
+- DB CHECK가 버전·enum·개수·직렬화 크기·유한 timestamp·양수/최대 24시간 만료 범위를 제한합니다. `created_at`과 TTL 기반 `expires_at`은 INSERT의 DB 시계를 사용합니다.
+- Down은 Step→Result 테이블 순서로 잠근 뒤 결과가 한 건이라도 있으면 거부합니다. 데이터·제약·migration 이력을 보존하며 빈 경우에만 새 테이블과 additive UNIQUE를 제거합니다.
+
+내부 조회는 정확한 키와 `expires_at > statement_timestamp()`만 읽고, DB 행의 버전·구조를 다시 검증해 독립 동결 snapshot을 반환합니다. 날짜는 변경 불가능한 ISO 문자열입니다. 만료·미존재·다른 Run/Step은 `null`, 이상한 행은 원문 없는 고정 오류입니다. `deleteExpiredToolResults()`는 DB 시각 기준 만료된 결과만 삭제하며 Run/Step·비만료 결과를 보존합니다. 자동 정리 worker가 없으므로 정확한 만료 순간의 물리 삭제, backup·복제본 삭제 또는 production retention compliance를 보장하지 않습니다.
+
+**A model request is not execution authorization.** 정책 객체와 Projector는 신뢰된 호스트 영역이며 임의 코드 부작용을 막는 sandbox가 아닙니다. 정상 native Promise 및 런타임 내장 함수의 무결성을 전제합니다. 키를 아는 것은 조회 권한이 아니며 사용자·테넌트 인증, 새 HTTP API, 실제 외부 Tool, 모델 연결은 없습니다. 여러 명시적 저장 호출이 여러 Step을 만들 수 있으며 Exactly-Once Tool Execution을 의미하지 않습니다. 기존 read→Handler race와 Lease·Timeout·Cancellation 부재는 그대로입니다. **P3**의 durable/recovery, **P4**의 사용자 승인·정책, **P6**의 production security·retention governance는 후속 범위입니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -518,13 +564,13 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~C는 완료됐으며 P2-D는 Run-Aware Bounded Tool Loop 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~D는 완료됐으며 P2-E는 Privacy-Gated Tool Result Persistence 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
-| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~C 완료; P2-D Run-Aware Tool Loop 구현·검토 중; 실제 외부 연동은 예정 |
+| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~D 완료; P2-E 제한된 Safe Result 저장 구현·검토 중; 실제 외부 연동은 예정 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
