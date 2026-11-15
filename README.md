@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P2-F — Bounded Public Read Tool 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A~E 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P3-A — Execution Lease Foundation 구현·검토 중 (미병합). P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -60,7 +60,7 @@ Axiom/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
-│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result repository
+│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result/Lease repository
 │   │   ├── runtime/            # one-shot / bounded / bounded-tool decisions
 │   │   ├── smoke/public-repo.ts # 명시적 opt-in 공개 읽기 smoke (자동 실행 없음)
 │   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / Executors / Result Policy
@@ -83,8 +83,9 @@ Axiom/
 │   │   ├── tool-execution-outcome.test.ts # strict 결과 계약·output snapshot·오류 비노출
 │   │   ├── in-memory-tool-executor.test.ts # Default Deny·Gate·Handler·출력 및 I/O 경계
 │   │   ├── public-repository-read*.ts # mock/native loopback 테스트 및 공용 fixture
+│   │   ├── execution-lease.test.ts # Lease 입력·잠금 순서·COMMIT·비노출
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
-│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results/public-repository-read.test.ts, process-fixture.ts
+│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results/public-repository-read/execution-leases.test.ts, process-fixture.ts
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
@@ -526,7 +527,7 @@ await results.deleteExpiredToolResults(); // Explicit maintenance; no background
 
 **A model request is not execution authorization.** 정책 객체와 Projector는 신뢰된 호스트 영역이며 임의 코드 부작용을 막는 sandbox가 아닙니다. 정상 native Promise 및 런타임 내장 함수의 무결성을 전제합니다. 키를 아는 것은 조회 권한이 아니며 사용자·테넌트 인증, 새 HTTP API, 실제 외부 Tool, 모델 연결은 없습니다. 여러 명시적 저장 호출이 여러 Step을 만들 수 있으며 Exactly-Once Tool Execution을 의미하지 않습니다. 기존 read→Handler race와 Lease·Timeout·Cancellation 부재는 그대로입니다. **P3**의 durable/recovery, **P4**의 사용자 승인·정책, **P6**의 production security·retention governance는 후속 범위입니다.
 
-## Bounded Public Read · 고정 공개 저장소 조회 (P2-F 구현·검토 중)
+## Bounded Public Read · 고정 공개 저장소 조회 (P2-F 완료)
 
 `createPublicRepositoryReadExecutor({ permitExecution? })`는 기존 순수 `createInMemoryToolExecutor()`와 별개인 내부 API입니다. 기존 P2-D 기본 구성과 Runtime 본체는 보존하며, 새 Executor를 `runBoundedToolDecisions()`의 dependency로 명시적으로 주입할 때만 사용합니다. 기본 HTTP routes·서버·worker에서 자동 등록하거나 실행하지 않습니다.
 
@@ -550,7 +551,7 @@ Preflight 실패는 기존 kind를 유지합니다. Gate 거부는 `execution_un
 
 **No-Store:** body와 최소 결과 모두 P2-E 저장 정책에 등록하지 않습니다. Runtime은 Tool 성공 Step COMMIT을 확인한 뒤 다음 결정에 outcome을 한 번 전달하고, synthetic final에서 Run과 종료 Step을 원자적으로 확정합니다. DB에는 기존 metadata만 남으며 `run_tool_results`는 0행입니다. 외부 데이터를 다음 모델 입력에 사용하는 미래 구성에서도 데이터는 지시문이 아닙니다.
 
-HTTP 중 DB transaction·부모 row lock은 유지하지 않습니다. HTTP 전에 terminal 상태를 관찰하면 요청 0회, 진행 중 외부 종료되면 기존 terminal 상태·Step을 보존하고 추가 Tool Step·다음 결정을 차단합니다. **DB 종료가 HTTP를 자동 취소하지는 않습니다.** 이미 시작한 요청은 deadline 안에서 끝날 수 있으며 read→call race와 lease 부재는 남아 있습니다. 불확실 COMMIT/DB 오류 이후 HTTP 자동 재시도는 없습니다.
+HTTP 중 DB transaction·부모 row lock은 유지하지 않습니다. HTTP 전에 terminal 상태를 관찰하면 요청 0회, 진행 중 외부 종료되면 기존 terminal 상태·Step을 보존하고 추가 Tool Step·다음 결정을 차단합니다. **DB 종료가 HTTP를 자동 취소하지는 않습니다.** 이미 시작한 요청은 deadline 안에서 끝날 수 있으며 read→call race와 이 Runtime의 lease 보호 부재는 남아 있습니다. 불확실 COMMIT/DB 오류 이후 HTTP 자동 재시도는 없습니다.
 
 ### Offline validation / Opt-in live smoke
 
@@ -565,7 +566,31 @@ npm run smoke:public-repo -- --allow-public-network
 
 Smoke의 임시 UUID는 로컬 연결용이며 실제 Run 상태나 사용자 인증의 증거가 아닙니다. 출력에는 고정 대상·KST 시각·Node 버전·시도 수·고정 실패 또는 최소 성공 결과만 포함합니다. 검증 보고에는 별도로 기준 HEAD와 미커밋 소스 SHA-256 지문을 함께 기록해야 합니다. **실제 live 결과: 2026-11-13 20:15:01 KST, Node v22.21.0에서 고정 GET 1회 PASS.** 검증된 Projection은 `{ schemaVersion: 1, repository: 'nodejs/node', stars: 123689, forks: 38061, archived: false }`입니다. 당시 기준 HEAD는 `f065815ff348a8239915dae7951e13e8d981e7fe`이며, 실행 보고에 미커밋 변경 파일 9개의 SHA-256을 함께 남겼습니다. 이 문서의 결과 기록만 smoke 후 갱신했고 구현·테스트·실행 설정은 동일합니다. 실패해도 자동 재실행하거나 다른 대상·인증으로 우회하지 않습니다.
 
-읽기 요청도 원격 서버에 IP·고정 헤더·시각과 사용량을 남길 수 있고 DB rollback으로 되돌릴 수 없습니다. 정상 Node 이벤트 루프·OS/DNS/TLS·신뢰된 host/transport를 전제합니다. 5초는 I/O deadline이며 임의 동기 무한루프를 선점하는 hard real-time 보장은 아닙니다. 사용자 auth·lease·전역 cancellation·durable/recovery·Exactly-Once·범용 SSRF sandbox·egress 방화벽을 제공하지 않습니다.
+읽기 요청도 원격 서버에 IP·고정 헤더·시각과 사용량을 남길 수 있고 DB rollback으로 되돌릴 수 없습니다. 정상 Node 이벤트 루프·OS/DNS/TLS·신뢰된 host/transport를 전제합니다. 5초는 I/O deadline이며 임의 동기 무한루프를 선점하는 hard real-time 보장은 아닙니다. 사용자 auth·Runtime lease 보호·전역 cancellation·durable/recovery·Exactly-Once·범용 SSRF sandbox·egress 방화벽을 제공하지 않습니다.
+
+## Execution Lease Foundation · 실행 소유권 메타데이터 (P3-A 구현·검토 중)
+
+P2-A~F는 병합·main 검증을 완료했습니다. P3-A는 Issue #31의 로컬 구현이며 아직 commit·PR·병합 완료 상태가 아닙니다. `apps/api/src/persistence/run-execution-lease-repository.ts`의 `createRunExecutionLeaseRepository(db)`는 전용 client를 제공하는 신뢰된 DB 의존성을 받습니다. HTTP나 기존 Runtime에 자동 연결하지 않습니다.
+
+| 내부 API | 계약 |
+| --- | --- |
+| `tryClaimRunLease(runId, { ownerId, leaseSeconds })` | queued이며 Lease가 없는 Run만 running으로 바꾸고 최초 Lease를 같은 트랜잭션에서 생성. 성공은 LeaseHandle, 조건 불충족은 null. |
+| `tryRenewRunLease(runId, { ownerId, leaseToken })` | running·동일 Owner/Token·미만료 조건을 만족할 때만 갱신. 저장된 TTL·Token·Owner·acquiredAt은 보존. |
+| `getRunLeaseSnapshot(runId)` | 없으면 null, 있으면 Token 없는 메타데이터와 active / expired / run_not_running 반환. Run 종료 상태가 만료 상태보다 우선. |
+
+Migration #8은 `run_execution_leases`에 run_id PK/FK, owner_id, UNIQUE lease_token, lease_seconds, acquired_at, renewed_at, expires_at만 저장합니다. FK 자동 CASCADE는 없으며 NOT NULL·유한 시각·renewed_at ≥ acquired_at·expires_at = renewed_at + lease_seconds를 강제합니다. 기간은 명시적인 정수 **1~300초**로, P2-E 결과 보존 TTL **1~86,400초**와 별개입니다. #1~7은 변경하지 않습니다. Down은 runs → Lease 테이블 순서로 잠그고, 같은 migration 트랜잭션에서 비어 있는 경우만 DROP합니다. 만료/terminal 행도 하나라도 남으면 데이터·제약·이력을 보존하며 거부합니다.
+
+Claim과 Renewal은 READ COMMITTED 전용 연결에서 **runs → run_execution_leases** 순서로 잠급니다. 두 잠금 statement가 끝난 뒤 후속 SQL의 materialized CTE가 `clock_timestamp()`를 한 번 샘플링합니다. Renewal은 같은 t로 `expires_at > t`와 `renewed_at <= t`를 검사하고 renewed_at=t, expires_at=t+저장된 기간으로 갱신합니다. 만료 등호와 명백한 clock 역행은 거부합니다. 트랜잭션 시작 시각인 `now()`를 사용하지 않고, JS Date로 시각을 SQL에 왕복 전달하지 않습니다. [PostgreSQL 시각 함수](https://www.postgresql.org/docs/16/functions-datetime.html), [잠금 규칙](https://www.postgresql.org/docs/16/explicit-locking.html), [node-postgres 트랜잭션](https://node-postgres.com/features/transactions)
+
+입력은 연결 전에 UUID 문자열·정수 범위·정확한 옵션 키를 검사합니다. UUID 대소문자는 정규화하고 getter/coercion으로 정책을 받지 않습니다. Token은 실제 Claim 경로에서 `crypto.randomUUID()`로 생성합니다. Claim에 Token/now/expiresAt, Renewal에 새 TTL/시각을 전달할 수 없습니다. 반환 객체는 readonly·동결된 독립 객체이며 시각은 PostgreSQL 마이크로초를 보존한 UTC 문자열입니다. Handle의 Token은 신뢰된 내부 갱신용이며 Snapshot SQL·반환·HTTP·자동 로그에는 포함하지 않습니다.
+
+Handle은 **COMMIT 응답 확인 뒤에만** 반환합니다. 조건 불충족(null)과 DB 오류(reject)를 구분하며, 부분 쓰기는 rollback합니다. COMMIT 오류 또는 rollback 실패는 연결을 폐기하고 자동 재시도하지 않습니다. 실제 COMMIT 후 응답 유실이면 Run/Lease 변경이 남았어도 호출자는 성공 Handle을 받지 못할 수 있습니다. Snapshot으로 Token을 복구하거나 자동 재개하지 않습니다. COMMIT/응답 지연 때문에 Handle 수신 시 이미 만료됐을 수 있으며, 반환 이후 일정 시간 실행 권한을 보장하지 않습니다.
+
+**A lease record is not execution authorization, complete fencing, or permission to replay.** Snapshot active는 관찰값으로 사용자 실행 허가나 후속 쓰기의 권한 증명이 아닙니다. UUID Token은 단조 증가 fencing epoch도 아닙니다. 기존 `tryFinishRun()`·Atomic Finalizer 등 Tokenless Writer는 여전히 Token 없이 종료할 수 있고 전체 fencing이 구현되지 않았습니다. 종료 후 Lease 행은 남고 Snapshot은 run_not_running, Renewal은 null입니다.
+
+**No Reclaim / No Replay / No Automatic Execution:** 만료가 프로세스 사망이나 외부 요청 미발생의 증거는 아닙니다. 재할당·Token 교체·자동 삭제·heartbeat·Worker·모델/Tool 호출·running→queued·retry·recovery를 수행하지 않습니다. Claim으로 running이 된 Run을 기존 Runtime에 넘겨 tryStartRun 검사를 우회하지 않습니다. 기존 P2-E Safe Result와 P2-F No-Store 결과는 자동 복구용 checkpoint가 아닙니다. P3-B 이후 모든 Writer의 fencing·checkpoint·recovery 설계와 별도 승인이 필요하며, P3 전체 완성이나 Exactly-Once를 의미하지 않습니다.
+
+Unit 테스트는 입력·행 검증·잠금 순서·COMMIT 전 비반환·연결 폐기·Token 비노출을 확인합니다. `test:db`는 실행별 `axiom_test` schema에서 독립 backend Claim/Legacy/종료 경합, 실제 잠금 대기 중 만료, 제약·실패 원자성·down 보호를 검증합니다. 마이크로초 경계는 **실제 repository SQL의 clock_timestamp() 표현식만** 테스트 DB 시계로 치환해 검사하며 production now override는 없습니다. COMMIT 후 응답 유실은 모사이며 실제 네트워크 단절 실험이 아닙니다. P2-F 회귀는 mock·소유 loopback만 사용하고 추가 Live 요청은 없습니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -607,14 +632,14 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~E는 완료됐으며 P2-F는 Bounded Public Read Tool 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A는 Execution Lease Foundation 구현·검토 단계입니다. P3-B 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
-| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~E 완료; P2-F 고정 공개 저장소 읽기 구현·검토 중 |
-| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
+| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
+| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A Lease Foundation 구현·검토 중; B 이후 미구현 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
