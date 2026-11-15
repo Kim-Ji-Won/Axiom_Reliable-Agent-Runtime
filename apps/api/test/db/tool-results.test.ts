@@ -91,16 +91,17 @@ async function bounded<T>(promise:Promise<T>):Promise<T>{let timer:ReturnType<ty
 async function waitLock(client:PoolClient,pid:number){await vi.waitFor(async()=>expect((await client.query("SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock'",[pid])).rowCount).toBe(1),{timeout:3000});}
 
 describe('real PostgreSQL privacy gated tool results',()=>{
-  it('migrates seven up/up/down/up, preserving all existing Run and Step data',async()=>withSchema(async({schema,client,db})=>{
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(7);
+  it('migrates eight up/up/down/down/up, preserving all existing Run and Step data',async()=>withSchema(async({schema,client,db})=>{
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(8);
     const r=await running(client);await createRunToolStepRecorder(db).appendToolSucceededStepIfRunning(r.id);
     const before=await snapshot(client);expect(await migrate('test','up',schema)).toHaveLength(0);
+    await migrate('test', 'down', schema); // empty execution Lease table (#8)
     expect(await migrate('test','down',schema)).toHaveLength(1);
     expect((await client.query("SELECT to_regclass('run_tool_results') AS name")).rows[0].name).toBeNull();
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before.runs);
     expect((await client.query('SELECT * FROM run_steps ORDER BY run_id,step_no')).rows).toEqual(before.steps);
     expect((await client.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(before.history.slice(0,6));
-    expect(await migrate('test','up',schema)).toHaveLength(1);
+    expect(await migrate('test','up',schema)).toHaveLength(2);
     const after=await snapshot(client);expect(after.runs).toEqual(before.runs);expect(after.steps).toEqual(before.steps);expect(after.constraints).toEqual(before.constraints);
     expect(after.history.slice(0,6)).toEqual(before.history.slice(0,6));
   }));
@@ -217,10 +218,12 @@ describe('real PostgreSQL privacy gated tool results',()=>{
     const after=await snapshot(client);expect(after.runs).toEqual(before.runs);expect(after.steps).toEqual(before.steps);expect(after.results).toHaveLength(1);expect(after.results[0].run_id).toBe(b.id);
   }));
   it('nonempty migration down preserves rows, all constraints and migration history',async()=>withSchema(async({schema,client,db})=>{
+    await migrate('test', 'down', schema); // empty execution Lease table (#8)
     const r=await running(client);await append(db,r.id);const before=await snapshot(client);
-    await expect(migrate('test','down',schema)).rejects.toThrow('Cannot drop nonempty run_tool_results');expect(await snapshot(client)).toEqual(before);expect(await migrate('test','up',schema)).toHaveLength(0);
+    await expect(migrate('test','down',schema)).rejects.toThrow('Cannot drop nonempty run_tool_results');expect(await snapshot(client)).toEqual(before);expect(await migrate('test','up',schema)).toHaveLength(1); // restore #8
   }));
   it('down waits for concurrent Step/Result transaction and then refuses without deleting either',async()=>withSchema(async({schema,client,db})=>{
+    await migrate('test', 'down', schema); // empty execution Lease table (#8)
     const r=await running(client);const writer=await db.connect();let pending:Promise<{error?:unknown}>|undefined;
     try {
       await writer.query('BEGIN');await writer.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,'tool_succeeded')",[r.id]);
