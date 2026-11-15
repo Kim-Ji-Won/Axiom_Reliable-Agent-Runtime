@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P2-E — Privacy-Gated Tool Result Persistence 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A~D 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 및 도구 호출은 연결하지 않았습니다.
+**현재 단계: P2-F — Bounded Public Read Tool 구현·검토 중. P0-A1~A4, P1-A~G 및 P2-A~E 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -16,7 +16,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 **A model request is not execution authorization.** 모델은 행동을 요청하고, Runtime은 그 행동의 실행 가능 여부를 결정합니다.
 
-다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight·실행 결과 데이터 계약과 신뢰된 순수 Handler를 위한 내부 In-Memory Executor와 선택적으로 호출하는 Run-Aware Tool Loop 및 별도 내부 API의 제한된 Safe Result 저장까지입니다.
+다음은 단계적으로 구현할 책임 경계입니다. 현재 구현은 Run HTTP API, PostgreSQL persistence, 모델 결정 계약, 내부 one-shot/bounded orchestration, Step metadata 저장소와 종료·기록의 원자적 결합, 실행 없는 Tool Registry·입력 snapshot 검증, Dispatch Preflight·실행 결과 데이터 계약과 신뢰된 순수 Handler를 위한 내부 In-Memory Executor와 선택적으로 호출하는 Run-Aware Tool Loop 및 별도 내부 API의 제한된 Safe Result 저장, 고정 공개 저장소 조회 Executor까지입니다.
 
 | 영역 | 책임 |
 | --- | --- |
@@ -48,7 +48,7 @@ Axiom은 이러한 실행 제어를 담당하는 공통 Runtime을 지향합니�
 
 `/health`는 **API liveness**만 나타냅니다. 데이터베이스 readiness나 외부 의존성의 정상 동작을 확인하지 않습니다.
 
-P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. P0-A3에서는 Run 생성·조회 API를 추가했습니다. 모델 호출, 외부 부작용 도구 실행, 워커, 사용자 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
+P0-A2에서는 PostgreSQL 개발·테스트 환경, 마이그레이션, Run repository와 DB 통합 테스트를 추가했습니다. P0-A3에서는 Run 생성·조회 API를 추가했습니다. 모델 호출, 외부 쓰기 도구 실행, 워커, 사용자 승인 정책과 durable execution은 향후 구현 범위입니다. 현재 단계는 로컬 개발 기반이며 production readiness를 보장하지 않습니다.
 
 ## Architecture · 프로젝트 구조
 
@@ -62,7 +62,8 @@ Axiom/
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
 │   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result repository
 │   │   ├── runtime/            # one-shot / bounded / bounded-tool decisions
-│   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / Executor / Result Policy
+│   │   ├── smoke/public-repo.ts # 명시적 opt-in 공개 읽기 smoke (자동 실행 없음)
+│   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / Executors / Result Policy
 │   ├── test/
 │   │   ├── health.test.ts      # liveness 및 미등록 경로 테스트
 │   │   ├── persistence.test.ts # 입력 및 테스트 DB 안전장치
@@ -81,8 +82,9 @@ Axiom/
 │   │   ├── tool-dispatch-preflight.test.ts # UUID·재검증·불변 Plan·비실행 경계
 │   │   ├── tool-execution-outcome.test.ts # strict 결과 계약·output snapshot·오류 비노출
 │   │   ├── in-memory-tool-executor.test.ts # Default Deny·Gate·Handler·출력 및 I/O 경계
+│   │   ├── public-repository-read*.ts # mock/native loopback 테스트 및 공용 fixture
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
-│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results.test.ts, process-fixture.ts
+│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results/public-repository-read.test.ts, process-fixture.ts
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
@@ -480,7 +482,7 @@ Step은 계속 `run_id`, `step_no`, `result_kind`, `created_at` **metadata만** 
 
 **A model request is not execution authorization.** 내부 Executor와 Decision Source는 신뢰된 호스트 의존성입니다. 정상 native Promise 및 런타임 내장 함수의 무결성을 전제로 하며, parser 성공은 실행 출처의 증명이 아닙니다. 사용자 인증·승인·Lease·임의 Handler Sandbox는 없고 Timeout·Cancellation·Recovery·Exactly-Once를 제공하지 않습니다. P2-D는 병합과 main 검증을 완료했습니다. 아래 P2-E는 별도 내부 저장 API이며 이 Runtime에 자동 연결하지 않습니다. Durable/crash recovery는 **P3**, 사용자 승인·권한 정책은 **P4** 범위입니다.
 
-## Privacy-Gated Tool Results · 제한된 내부 저장 (P2-E 구현·검토 중)
+## Privacy-Gated Tool Results · 제한된 내부 저장 (P2-E 완료)
 
 **Validation is not permission to persist.** 기본은 **Default No-Store**입니다. 기존 `runBoundedToolDecisions()`와 `appendToolSucceededStepIfRunning()`은 계속 Step metadata만 기록하며 Tool Output을 저장하지 않습니다. 새 저장소는 신뢰된 호스트 코드가 별도로 호출해야 합니다. 모델의 `approved`, `persist`, `save`, Handler 성공 및 Outcome 파싱 성공은 저장 권한이 아닙니다.
 
@@ -524,6 +526,47 @@ await results.deleteExpiredToolResults(); // Explicit maintenance; no background
 
 **A model request is not execution authorization.** 정책 객체와 Projector는 신뢰된 호스트 영역이며 임의 코드 부작용을 막는 sandbox가 아닙니다. 정상 native Promise 및 런타임 내장 함수의 무결성을 전제합니다. 키를 아는 것은 조회 권한이 아니며 사용자·테넌트 인증, 새 HTTP API, 실제 외부 Tool, 모델 연결은 없습니다. 여러 명시적 저장 호출이 여러 Step을 만들 수 있으며 Exactly-Once Tool Execution을 의미하지 않습니다. 기존 read→Handler race와 Lease·Timeout·Cancellation 부재는 그대로입니다. **P3**의 durable/recovery, **P4**의 사용자 승인·정책, **P6**의 production security·retention governance는 후속 범위입니다.
 
+## Bounded Public Read · 고정 공개 저장소 조회 (P2-F 구현·검토 중)
+
+`createPublicRepositoryReadExecutor({ permitExecution? })`는 기존 순수 `createInMemoryToolExecutor()`와 별개인 내부 API입니다. 기존 P2-D 기본 구성과 Runtime 본체는 보존하며, 새 Executor를 `runBoundedToolDecisions()`의 dependency로 명시적으로 주입할 때만 사용합니다. 기본 HTTP routes·서버·worker에서 자동 등록하거나 실행하지 않습니다.
+
+- Tool은 `github_public_repo_stats` 하나, 모델 arguments는 strict `{}`만 허용합니다. URL·headers·token·timeout·승인·저장 플래그는 입력할 수 없습니다.
+- 기존 Preflight → 생성 시 캡처한 동기 Host Gate → HTTP 순서입니다. Gate가 없거나 정확한 원시 `true`가 아니면 **Default Deny**입니다. 입력 실패 → Gate 거부 → pre-aborted host signal 순으로 판정하고, 허용되지 않은 호출은 요청 0회입니다. Gate에는 동결된 검증 Plan만 전달합니다.
+- 대상은 **GET `https://api.github.com/repos/nodejs/node`** 하나입니다. 명시적 헤더는 `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2026-03-10`, `User-Agent: Axiom-Public-Read-Tool`입니다. 정상 TLS 검증을 유지하며 인증·Cookie·body·query, Run ID·task·모델 원문·환경 변수·로컬 경로를 전송하지 않습니다. GitHub CLI 인증이나 token을 읽지 않습니다. [GitHub API 버전 문서](https://docs.github.com/en/rest/about-the-rest-api/api-versions)
+- `redirect: 'error'`, retry·pagination·fallback·사전 HEAD 없음. execute당 애플리케이션 HTTP 시도는 최대 1회입니다. 프로덕션 Factory에 URL·transport·proxy·deadline 변경 옵션은 없습니다. 내부 테스트 seam은 transport를 반드시 주입해야 하며 누락 시 native fetch로 fallback하지 않습니다.
+- 요청 시작부터 body 소비 완료까지 **단일 5,000ms deadline**입니다. optional third argument `{ signal }`은 신뢰된 호스트의 per-call 신호이며 모델 입력과 분리합니다. 실제 fetch에 AbortSignal을 연결하고 timeout/host abort 시 미완료 body를 취소합니다. 소유 reader의 cancel·lock 해제, timer·listener 정리 및 cleanup rejection 관찰을 수행합니다. 정리를 무기한 기다리지 않습니다.
+- 실제 소비하는 body(압축된 경우 **압축 해제 후**)는 최대 **65,536 bytes**입니다. Content-Length를 신뢰하지 않고 chunk를 저장하기 전에 누적 크기를 확인합니다. 65,536 허용, 65,537 거부이며 Node/TLS 내부 버퍼를 포함한 전체 메모리 상한이라는 뜻은 아닙니다.
+- `application/json` 또는 유효한 `application/*+json`만 허용하며 parameter는 선택적인 `charset=utf-8`만 허용합니다. UTF-8을 엄격히 decode하고 JSON object를 한 번 파싱합니다. `full_name === 'nodejs/node'`, `private === false`, 비음수 safe integer 통계와 boolean `archived`를 확인합니다. 다른 필드는 무시하고 자유 텍스트·URL·명령을 실행하거나 전달하지 않습니다.
+
+성공 결과는 기존 Outcome parser를 거쳐 독립 복사·deep freeze한 아래 최소 Projection입니다. 기존 8,192-byte/depth-8 제한은 이 Projection에 적용합니다.
+
+```ts
+{ kind: 'tool_succeeded', output: {
+  schemaVersion: 1, repository: 'nodejs/node', stars: 123, forks: 45, archived: false,
+} }
+```
+
+Preflight 실패는 기존 kind를 유지합니다. Gate 거부는 `execution_unavailable`, 네트워크·TLS·비200·전송 오류·timeout·host abort는 `handler_error`, HTTP 200의 type·크기·UTF-8·JSON·필드 오류는 `invalid_tool_output`입니다. 모두 `tool_failed`의 기존 고정 code만 반환하며 원문 오류·body·headers·stack·cause·abort reason을 자동 로그하거나 반환하지 않습니다.
+
+**No-Store:** body와 최소 결과 모두 P2-E 저장 정책에 등록하지 않습니다. Runtime은 Tool 성공 Step COMMIT을 확인한 뒤 다음 결정에 outcome을 한 번 전달하고, synthetic final에서 Run과 종료 Step을 원자적으로 확정합니다. DB에는 기존 metadata만 남으며 `run_tool_results`는 0행입니다. 외부 데이터를 다음 모델 입력에 사용하는 미래 구성에서도 데이터는 지시문이 아닙니다.
+
+HTTP 중 DB transaction·부모 row lock은 유지하지 않습니다. HTTP 전에 terminal 상태를 관찰하면 요청 0회, 진행 중 외부 종료되면 기존 terminal 상태·Step을 보존하고 추가 Tool Step·다음 결정을 차단합니다. **DB 종료가 HTTP를 자동 취소하지는 않습니다.** 이미 시작한 요청은 deadline 안에서 끝날 수 있으며 read→call race와 lease 부재는 남아 있습니다. 불확실 COMMIT/DB 오류 이후 HTTP 자동 재시도는 없습니다.
+
+### Offline validation / Opt-in live smoke
+
+`npm test` 및 `npm run test:db -- --reporter=verbose`의 새 테스트는 mock 또는 자체 loopback만 사용합니다. loopback adapter는 먼저 정확한 production URL·GET·옵션을 확인한 뒤 자신의 로컬 서버로 전송합니다. native fetch의 redirect 거부, 압축·크기 경계, 단일 deadline, 실제 연결 종료와 격리 DB의 claim 경쟁·COMMIT 순서·외부 종료·실패·No-Store를 검증합니다. 기존 7개 migration과 P2-E TTL 회귀는 그대로 실행합니다.
+
+아래 명령은 **공개 인터넷 GET을 실제 1회 시도**하므로 승인된 경우에만 별도로 실행합니다. 일반 테스트·build·import·서버 시작에서 실행되지 않습니다. `.env`를 로드하지 않으며 DB·LLM·자격증명 조회·파일 업로드를 하지 않습니다. 플래그 누락/추가 인자는 요청 0회로 거부합니다.
+
+```sh
+npm run build
+npm run smoke:public-repo -- --allow-public-network
+```
+
+Smoke의 임시 UUID는 로컬 연결용이며 실제 Run 상태나 사용자 인증의 증거가 아닙니다. 출력에는 고정 대상·KST 시각·Node 버전·시도 수·고정 실패 또는 최소 성공 결과만 포함합니다. 검증 보고에는 별도로 기준 HEAD와 미커밋 소스 SHA-256 지문을 함께 기록해야 합니다. **실제 live 결과: 2026-11-13 20:15:01 KST, Node v22.21.0에서 고정 GET 1회 PASS.** 검증된 Projection은 `{ schemaVersion: 1, repository: 'nodejs/node', stars: 123689, forks: 38061, archived: false }`입니다. 당시 기준 HEAD는 `f065815ff348a8239915dae7951e13e8d981e7fe`이며, 실행 보고에 미커밋 변경 파일 9개의 SHA-256을 함께 남겼습니다. 이 문서의 결과 기록만 smoke 후 갱신했고 구현·테스트·실행 설정은 동일합니다. 실패해도 자동 재실행하거나 다른 대상·인증으로 우회하지 않습니다.
+
+읽기 요청도 원격 서버에 IP·고정 헤더·시각과 사용량을 남길 수 있고 DB rollback으로 되돌릴 수 없습니다. 정상 Node 이벤트 루프·OS/DNS/TLS·신뢰된 host/transport를 전제합니다. 5초는 I/O deadline이며 임의 동기 무한루프를 선점하는 hard real-time 보장은 아닙니다. 사용자 auth·lease·전역 cancellation·durable/recovery·Exactly-Once·범용 SSRF sandbox·egress 방화벽을 제공하지 않습니다.
+
 ## Run HTTP API · 생성과 조회
 
 루트에서 `npm run build` 후 `npm start`를 실행합니다. `npm start`는 저장소 루트의 `.env`를 읽으며, 기존 환경 변수가 우선합니다. `packages/contracts`의 Zod 스키마와 타입은 workspace 패키지로 공유하고 빌드 시 JavaScript 및 타입 선언을 생성합니다.
@@ -564,13 +607,13 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~D는 완료됐으며 P2-E는 Privacy-Gated Tool Result Persistence 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~E는 완료됐으며 P2-F는 Bounded Public Read Tool 구현·검토 단계입니다. 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
-| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~D 완료; P2-E 제한된 Safe Result 저장 구현·검토 중; 실제 외부 연동은 예정 |
+| P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~E 완료; P2-F 고정 공개 저장소 읽기 구현·검토 중 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | 예정 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
