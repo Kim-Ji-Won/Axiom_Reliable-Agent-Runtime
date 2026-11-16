@@ -319,9 +319,9 @@ describe('real PostgreSQL bounded decisions', () => {
     await migrate('test', 'down', schema); // tool Step kinds; exercise migration five below
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(5);
     await migrate('test', 'down', schema);
-    const repo = createRunRepository(client); const steps = createRunStepRepository(db);
-    const created = await repo.createRun('preserved queued'); const running = await repo.createRun('preserved running'); await repo.tryStartRun(running.id);
-    for (const kind of ['completed', 'unsupported_tool_request', 'invalid_decision', 'decision_source_error', 'finalize_conflict'] as const) await steps.appendRunStep(created.id, kind);
+    const repo = createRunRepository(client); // historical schema preparation uses direct SQL
+    const created = await repo.createRun('preserved queued'); const running = await repo.createRun('preserved running'); await client.query("UPDATE runs SET status='running' WHERE id=$1", [running.id]); // historical schema fixture
+    for (const kind of ['completed', 'unsupported_tool_request', 'invalid_decision', 'decision_source_error', 'finalize_conflict'] as const) await client.query("INSERT INTO run_steps(run_id,step_no,result_kind) SELECT $1,COALESCE(MAX(step_no),0)+1,$2 FROM run_steps WHERE run_id=$1", [created.id,kind]);
     const before = await snapshot(client);
     const columns = (await client.query("SELECT table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name IN ('runs','run_steps') ORDER BY table_name,ordinal_position", [schema])).rows;
     expect(await migrate('test', 'up', schema)).toHaveLength(4);
@@ -348,9 +348,9 @@ describe('real PostgreSQL bounded decisions', () => {
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test', 'down', schema); // safe result table
     await migrate('test', 'down', schema); // exercise migration five's guard
-    const repo = createRunRepository(client); const created = await repo.createRun('preserve new kind'); await repo.tryStartRun(created.id);
-    if (kind === 'continued') await createRunContinueRecorder(db).appendContinuedStepIfRunning(created.id);
-    else await createAtomicRunFinalizer(db).tryFinalizeWithStep(created.id, kind);
+    const repo = createRunRepository(client); const created = await repo.createRun('preserve new kind'); // Historical migration-five fixture; current writers require #8.
+    await client.query('UPDATE runs SET status=$2 WHERE id=$1', [created.id, kind === 'continued' ? 'running' : 'failed']);
+    await client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,$2)', [created.id,kind]);
     const before = await snapshot(client);
     await expect(migrate('test', 'down', schema)).rejects.toThrow('Cannot remove recorded loop Step kinds');
     expect(await snapshot(client)).toEqual(before);

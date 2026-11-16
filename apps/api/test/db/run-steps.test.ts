@@ -61,8 +61,8 @@ describe('real PostgreSQL Run Step history', () => {
     const runs = createRunRepository(client);
     const queued = await runs.createRun('preserve existing queued');
     const terminal = await runs.createRun('preserve existing completed');
-    await runs.tryStartRun(terminal.id);
-    await runs.tryFinishRun(terminal.id, 'completed');
+    // Historical schema #3 fixture, not a current Writer API bypass.
+    await client.query("UPDATE runs SET status='completed' WHERE id=$1", [terminal.id]);
     const before = (await client.query('SELECT * FROM runs ORDER BY id')).rows;
     const runDefinition = async () => ({
       constraints: (await client.query("SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid='runs'::regclass ORDER BY conname")).rows,
@@ -188,7 +188,8 @@ describe('real PostgreSQL Run Step history', () => {
     await migrate('test', 'down', schema); // tool Step kinds
     await migrate('test', 'down', schema); // test the original Step-table downgrade
     const run = await createRunRepository(client).createRun('preserve history');
-    await createRunStepRepository(db).appendRunStep(run.id, 'completed');
+    // Historical Step-table fixture; current append requires migration #8.
+    await client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,'completed')", [run.id]);
     const before = await snapshot(client);
     await expect(migrate('test', 'down', schema)).rejects.toThrow('Cannot drop nonempty run_steps');
     expect(await snapshot(client)).toEqual(before);

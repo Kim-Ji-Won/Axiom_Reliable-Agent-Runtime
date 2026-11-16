@@ -218,13 +218,15 @@ describe('real PostgreSQL privacy gated tool results',()=>{
     const after=await snapshot(client);expect(after.runs).toEqual(before.runs);expect(after.steps).toEqual(before.steps);expect(after.results).toHaveLength(1);expect(after.results[0].run_id).toBe(b.id);
   }));
   it('nonempty migration down preserves rows, all constraints and migration history',async()=>withSchema(async({schema,client,db})=>{
-    await migrate('test', 'down', schema); // empty execution Lease table (#8)
-    const r=await running(client);await append(db,r.id);const before=await snapshot(client);
+    const r=await running(client);await append(db,r.id);
+    await migrate('test', 'down', schema); // prepare through current API before downgrading
+    const before=await snapshot(client);
     await expect(migrate('test','down',schema)).rejects.toThrow('Cannot drop nonempty run_tool_results');expect(await snapshot(client)).toEqual(before);expect(await migrate('test','up',schema)).toHaveLength(1); // restore #8
   }));
   it('down waits for concurrent Step/Result transaction and then refuses without deleting either',async()=>withSchema(async({schema,client,db})=>{
-    await migrate('test', 'down', schema); // empty execution Lease table (#8)
-    const r=await running(client);const writer=await db.connect();let pending:Promise<{error?:unknown}>|undefined;
+    const r=await running(client);
+    await migrate('test', 'down', schema); // current API requires #8; subsequent SQL is historical fixture
+    const writer=await db.connect();let pending:Promise<{error?:unknown}>|undefined;
     try {
       await writer.query('BEGIN');await writer.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,'tool_succeeded')",[r.id]);
       await writer.query("INSERT INTO run_tool_results(run_id,step_no,schema_version,status,item_count,expires_at) VALUES($1,1,1,'ok',3,statement_timestamp()+INTERVAL '1 hour')",[r.id]);

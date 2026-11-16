@@ -11,13 +11,13 @@ function setup() {
       tryStartRun: vi.fn<BoundedRuntimeDependencies['repository']['tryStartRun']>().mockResolvedValue(run),
       findRunById: vi.fn<BoundedRuntimeDependencies['repository']['findRunById']>().mockResolvedValue(run),
     },
-    finalizer: {
+    finalizer: { tryFinalizeWithStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); },
       tryFinalizeWithStep: vi.fn<BoundedRuntimeDependencies['finalizer']['tryFinalizeWithStep']>().mockImplementation(async (_, kind) => ({
         run: { ...run, status: kind === 'completed' ? 'completed' : 'failed' },
         step: { runId: id, stepNo: 1, resultKind: kind, createdAt: run.createdAt },
       })),
     },
-    continueRecorder: {
+    continueRecorder: { appendContinuedStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); },
       appendContinuedStepIfRunning: vi.fn<BoundedRuntimeDependencies['continueRecorder']['appendContinuedStepIfRunning']>()
         .mockResolvedValue({ runId: id, stepNo: 1, resultKind: 'continued', createdAt: run.createdAt }),
     },

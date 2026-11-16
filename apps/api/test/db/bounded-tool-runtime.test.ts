@@ -321,8 +321,9 @@ describe('real PostgreSQL bounded tool Runtime', () => {
     await migrate('test','down',schema); // safe result table; exercise migration six
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(6);
     expect(await migrate('test','down',schema)).toHaveLength(1);
-    const repo = createRunRepository(client); const created = await repo.createRun('preserved'); await repo.tryStartRun(created.id);
-    await createRunContinueRecorder(db).appendContinuedStepIfRunning(created.id);
+    const repo = createRunRepository(client); const created = await repo.createRun('preserved'); // Historical schema-five fixture, not a current writer invocation.
+    await client.query("UPDATE runs SET status='running' WHERE id=$1", [created.id]);
+    await client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,'continued')", [created.id]);
     const before = await snapshot(client);
     expect(await migrate('test','up',schema)).toHaveLength(3); expect(await migrate('test','up',schema)).toHaveLength(0);
     const after = await snapshot(client); expect(after.runs).toEqual(before.runs); expect(after.steps).toEqual(before.steps); expect(after.history.slice(0,5)).toEqual(before.history);
@@ -341,9 +342,9 @@ describe('real PostgreSQL bounded tool Runtime', () => {
   it.each(['tool_succeeded','tool_failed','tool_request_rejected','tool_execution_limit_exceeded'] as const)('refuses down with %s preserving data, constraints and history', async kind => withSchema(async ({ schema, client, db }) => {
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test','down',schema); // exercise migration six guard
-    const created = await createRunRepository(client).createRun('down guard'); await createRunRepository(client).tryStartRun(created.id);
-    if (kind === 'tool_succeeded') await createRunToolStepRecorder(db).appendToolSucceededStepIfRunning(created.id);
-    else await createAtomicRunFinalizer(db).tryFinalizeWithStep(created.id,kind);
+    const created = await createRunRepository(client).createRun('down guard'); // Historical schema-six fixture; API regression runs on all eight migrations.
+    await client.query('UPDATE runs SET status=$2 WHERE id=$1', [created.id,kind === 'tool_succeeded' ? 'running' : 'failed']);
+    await client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,$2)', [created.id,kind]);
     const before = await snapshot(client);
     await expect(migrate('test','down',schema)).rejects.toThrow('Cannot remove recorded tool Step kinds');
     expect(await snapshot(client)).toEqual(before); expect(await migrate('test','up',schema)).toHaveLength(2);

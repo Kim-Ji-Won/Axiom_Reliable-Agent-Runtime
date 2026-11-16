@@ -1,3 +1,4 @@
+import { hasRunLease } from './lease-write-guard.js';
 import { InvalidRunInputError, runIdSchema } from '@axiom/contracts';
 import type { PoolClient, QueryResultRow } from 'pg';
 
@@ -48,11 +49,13 @@ export function createRunStepRepository(db: StepDatabase) {
       if (!appendRunStepResultKinds.some(kind => kind === resultKind)) throw new InvalidRunInputError('Invalid Run Step result kind');
       const client = await db.connect();
       let discard = false;
+      let committing = false;
       try {
         // A new statement snapshot after the parent lock observes the previous append.
         await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
         const parent = await client.query('SELECT id FROM runs WHERE id = $1 FOR UPDATE', [runId]);
-        if (parent.rowCount === 0) {
+        if (parent.rowCount === 0 || await hasRunLease(client, runId)) {
+          committing = true;
           await client.query('COMMIT');
           return null;
         }
@@ -63,9 +66,11 @@ export function createRunStepRepository(db: StepDatabase) {
         );
         if (!inserted.rows[0]) throw new Error('Run Step insert returned no row');
         const step = toStep(inserted.rows[0]);
+        committing = true;
         await client.query('COMMIT');
         return step;
       } catch (error) {
+        discard = committing;
         try { await client.query('ROLLBACK'); }
         catch { discard = true; } // Never return a connection with an unknown transaction state.
         throw error;

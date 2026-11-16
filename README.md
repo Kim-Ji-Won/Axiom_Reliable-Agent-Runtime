@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P3-A — Execution Lease Foundation 구현·검토 중 (미병합). P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P3-B — Lease-Aware Persistence 구현·검토 중 (미병합). P3-A 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -60,7 +60,7 @@ Axiom/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
-│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result/Lease repository
+│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result/Lease repository 및 내부 Lease write guard
 │   │   ├── runtime/            # one-shot / bounded / bounded-tool decisions
 │   │   ├── smoke/public-repo.ts # 명시적 opt-in 공개 읽기 smoke (자동 실행 없음)
 │   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / Executors / Result Policy
@@ -84,8 +84,9 @@ Axiom/
 │   │   ├── in-memory-tool-executor.test.ts # Default Deny·Gate·Handler·출력 및 I/O 경계
 │   │   ├── public-repository-read*.ts # mock/native loopback 테스트 및 공용 fixture
 │   │   ├── execution-lease.test.ts # Lease 입력·잠금 순서·COMMIT·비노출
+│   │   ├── lease-aware-persistence.test.ts # Credential snapshot·쓰기 Guard·실패 경계
 │   │   ├── runs-http.test.ts   # Run 계약·오류·라우터 회귀 테스트
-│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results/public-repository-read/execution-leases.test.ts, process-fixture.ts
+│   │   └── db/                # runs/run-steps/atomic-finalization/bounded-runtime/bounded-tool-runtime/tool-results/public-repository-read/execution-leases/lease-aware-persistence.test.ts, process-fixture.ts
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── tsconfig.build.json
@@ -568,9 +569,9 @@ Smoke의 임시 UUID는 로컬 연결용이며 실제 Run 상태나 사용자 �
 
 읽기 요청도 원격 서버에 IP·고정 헤더·시각과 사용량을 남길 수 있고 DB rollback으로 되돌릴 수 없습니다. 정상 Node 이벤트 루프·OS/DNS/TLS·신뢰된 host/transport를 전제합니다. 5초는 I/O deadline이며 임의 동기 무한루프를 선점하는 hard real-time 보장은 아닙니다. 사용자 auth·Runtime lease 보호·전역 cancellation·durable/recovery·Exactly-Once·범용 SSRF sandbox·egress 방화벽을 제공하지 않습니다.
 
-## Execution Lease Foundation · 실행 소유권 메타데이터 (P3-A 구현·검토 중)
+## Execution Lease Foundation · 실행 소유권 메타데이터 (P3-A 완료)
 
-P2-A~F는 병합·main 검증을 완료했습니다. P3-A는 Issue #31의 로컬 구현이며 아직 commit·PR·병합 완료 상태가 아닙니다. `apps/api/src/persistence/run-execution-lease-repository.ts`의 `createRunExecutionLeaseRepository(db)`는 전용 client를 제공하는 신뢰된 DB 의존성을 받습니다. HTTP나 기존 Runtime에 자동 연결하지 않습니다.
+P2-A~F는 병합·main 검증을 완료했습니다. P3-A는 PR #32로 병합됐으며 main 전체 검증을 완료했습니다. `apps/api/src/persistence/run-execution-lease-repository.ts`의 `createRunExecutionLeaseRepository(db)`는 전용 client를 제공하는 신뢰된 DB 의존성을 받습니다. HTTP나 기존 Runtime에 자동 연결하지 않습니다.
 
 | 내부 API | 계약 |
 | --- | --- |
@@ -586,11 +587,40 @@ Claim과 Renewal은 READ COMMITTED 전용 연결에서 **runs → run_execution_
 
 Handle은 **COMMIT 응답 확인 뒤에만** 반환합니다. 조건 불충족(null)과 DB 오류(reject)를 구분하며, 부분 쓰기는 rollback합니다. COMMIT 오류 또는 rollback 실패는 연결을 폐기하고 자동 재시도하지 않습니다. 실제 COMMIT 후 응답 유실이면 Run/Lease 변경이 남았어도 호출자는 성공 Handle을 받지 못할 수 있습니다. Snapshot으로 Token을 복구하거나 자동 재개하지 않습니다. COMMIT/응답 지연 때문에 Handle 수신 시 이미 만료됐을 수 있으며, 반환 이후 일정 시간 실행 권한을 보장하지 않습니다.
 
-**A lease record is not execution authorization, complete fencing, or permission to replay.** Snapshot active는 관찰값으로 사용자 실행 허가나 후속 쓰기의 권한 증명이 아닙니다. UUID Token은 단조 증가 fencing epoch도 아닙니다. 기존 `tryFinishRun()`·Atomic Finalizer 등 Tokenless Writer는 여전히 Token 없이 종료할 수 있고 전체 fencing이 구현되지 않았습니다. 종료 후 Lease 행은 남고 Snapshot은 run_not_running, Renewal은 null입니다.
+**A lease record is not execution authorization, complete fencing, or permission to replay.** Snapshot active는 관찰값으로 사용자 실행 허가나 후속 쓰기의 권한 증명이 아닙니다. UUID Token은 단조 증가 fencing epoch도 아닙니다. P3-B의 지원 Tokenless Writer는 Lease가 있는 Run의 변경을 거부합니다. 유효 credential의 Lease-aware Finalizer로 종료하면 Lease 행은 남고 Snapshot은 run_not_running, Renewal은 null입니다. 직접 SQL·구버전 Writer·외부 서비스에 대한 전체 fencing은 제공하지 않습니다.
 
-**No Reclaim / No Replay / No Automatic Execution:** 만료가 프로세스 사망이나 외부 요청 미발생의 증거는 아닙니다. 재할당·Token 교체·자동 삭제·heartbeat·Worker·모델/Tool 호출·running→queued·retry·recovery를 수행하지 않습니다. Claim으로 running이 된 Run을 기존 Runtime에 넘겨 tryStartRun 검사를 우회하지 않습니다. 기존 P2-E Safe Result와 P2-F No-Store 결과는 자동 복구용 checkpoint가 아닙니다. P3-B 이후 모든 Writer의 fencing·checkpoint·recovery 설계와 별도 승인이 필요하며, P3 전체 완성이나 Exactly-Once를 의미하지 않습니다.
+**No Reclaim / No Replay / No Automatic Execution:** 만료가 프로세스 사망이나 외부 요청 미발생의 증거는 아닙니다. 재할당·Token 교체·자동 삭제·heartbeat·Worker·모델/Tool 호출·running→queued·retry·recovery를 수행하지 않습니다. Claim으로 running이 된 Run을 기존 Runtime에 넘겨 tryStartRun 검사를 우회하지 않습니다. 기존 P2-E Safe Result와 P2-F No-Store 결과는 자동 복구용 checkpoint가 아닙니다. 지원 API 밖의 fencing·checkpoint·recovery는 후속 설계와 별도 승인이 필요하며, P3 전체 완성이나 Exactly-Once를 의미하지 않습니다.
 
 Unit 테스트는 입력·행 검증·잠금 순서·COMMIT 전 비반환·연결 폐기·Token 비노출을 확인합니다. `test:db`는 실행별 `axiom_test` schema에서 독립 backend Claim/Legacy/종료 경합, 실제 잠금 대기 중 만료, 제약·실패 원자성·down 보호를 검증합니다. 마이크로초 경계는 **실제 repository SQL의 clock_timestamp() 표현식만** 테스트 DB 시계로 치환해 검사하며 production now override는 없습니다. COMMIT 후 응답 유실은 모사이며 실제 네트워크 단절 실험이 아닙니다. P2-F 회귀는 mock·소유 loopback만 사용하고 추가 Live 요청은 없습니다.
+
+## Lease-Aware Persistence · 쓰기 경계 보호 (P3-B 구현·검토 중)
+
+Issue #33의 로컬 구현이며 아직 제출·병합하지 않았습니다. **Lease existence selects the write protocol. Expiry never falls back to legacy writes.** Lease의 존재 자체가 쓰기 경로를 선택합니다. expired·terminal·방어용 queued+Lease도 Legacy 쓰기를 열지 않습니다.
+
+| 지원 API | Lease 없음 | Lease 있음 |
+| --- | --- | --- |
+| `tryStartRun` / `tryFinishRun` | 기존 queued/running 조건부 전이 | null |
+| `appendRunStep` | 기존 상태별 의미 유지 (running 전용으로 축소하지 않음) | null |
+| `tryFinalizeWithStep` | running에서 Run+terminal Step | null |
+| `appendContinuedStepIfRunning` / `appendToolSucceededStepIfRunning` | running에서 Step 추가 | null |
+| `appendToolSucceededStepWithSafeResultIfRunning` | 기존 정책 통과 후 running에서 Step+Result | 정책 거부는 no_store, 준비 성공 후에는 null |
+| `tryFinalizeWithStepWithLease` | null | 유효 credential·running·시간 Guard에서 Run+terminal Step |
+| `appendContinuedStepWithLease` / `appendToolSucceededStepWithLease` | null | 같은 Guard에서 Step 추가 |
+| `appendToolSucceededStepWithSafeResultWithLease` | 정책 허용 시 null | Trusted Policy AND 같은 Lease Guard에서 Step+Result |
+
+Lease-aware credential은 정확히 `{ ownerId, leaseToken }`인 UUID 문자열이며 대소문자를 정규화합니다. 전체 Handle·Snapshot·now·TTL·skipLease·force·authorized 등은 받지 않습니다. Getter/Setter/Proxy를 실행하지 않으며 첫 await 전에 원시 값을 캡처합니다. 잘못된 credential은 정책 미설정 여부와 무관하게 연결 전 고정 입력 오류입니다. 정상 형식에서 정책 준비가 실패하면 no_store·DB 연결 0회, 정책 준비 성공 후 Lease 조건이 틀리면 null·쓰기 0행입니다.
+
+**A snapshot is not write authorization. A valid lease is not permission to execute or persist arbitrary data.** P2-E의 WeakMap 기반 Trusted Policy, 고정 3필드·1,024-byte 상한·TTL 1~86,400초·PostgreSQL 정밀도의 ttl_valid와 P2-F No-Store를 유지합니다. Projector는 트랜잭션 전에 완료합니다. Token을 반환 Step/Result·로그·HTTP·진단 이력에 추가하지 않습니다.
+
+다중 문장 Legacy Writer는 READ COMMITTED 전용 client에서 부모 Run을 잠근 **뒤 새 statement**로 Lease 존재를 검사합니다. Claim의 COMMIT을 기다렸다면 새 snapshot에서 생긴 Lease를 보고 거부합니다. Finalizer도 Lease 검사 전 Run 상태를 바꾸지 않습니다. query-only `tryStartRun/tryFinishRun`은 Pool·PoolClient 계약을 유지하고 한 UPDATE에 NOT EXISTS를 추가합니다. 이 예외는 Claim이 queued→running과 Lease 생성의 유일한 지원 경로이고, running Run 사후 Lease 부착·Lease 삭제·requeue가 없다는 불변식에 의존합니다. 일반 append나 미래 Reclaim에 일반화하지 않습니다.
+
+새 쓰기는 **runs → Lease** 잠금 statement를 모두 완료한 뒤 **첫 DML의 단일 clock_timestamp()**로 쓰기 진입을 판정합니다. 같은 DB 정밀도에서 running·run/owner/token 일치·expires_at > t·renewed_at <= t 및 유한 시각·기간·시간 관계를 검사합니다. Snapshot/JS Date/트랜잭션 시작 시각을 허가에 사용하지 않습니다. Guard는 Step 순번 집계 바깥의 입력이므로 Guard 0행이 MAX 집계 때문에 INSERT 1행으로 바뀌지 않습니다. 부모 잠금은 순번 계산과 COMMIT까지 유지합니다.
+
+보장은 진입 판정 시각 t의 유효성입니다. **잠금 대기 중 만료는 거부**하지만, 판정 후 지연된 COMMIT은 만료 뒤 확정·반환될 수 있습니다. 자동 갱신이나 retry로 시간을 수리하지 않습니다. Finalizer의 Run+Step, Safe Result의 Step+Result는 각각 원자적이며 COMMIT 확인 후 반환합니다. COMMIT 오류·rollback 실패는 연결 discard, 자동 재호출 없음입니다. 실제 COMMIT 후 응답 유실 검증은 모사이며 실제 네트워크 단절 실험은 아닙니다. 결정적 ±1μs/역행 테스트도 실제 SQL의 시계 표현식만 치환한 fixture로, 실제 clock 장애를 주입한 것은 아닙니다.
+
+보호 범위는 **수정된 지원 Repository API**입니다. raw SQL·DB 소유자·악성 호스트·구버전 Writer·혼합 버전 배포·외부 서비스까지 강제하는 보안 경계가 아닙니다. 필요한 migration #1~8이 없으면 인프라 오류이며 보호를 생략하지 않습니다. 과거 migration 테스트는 최소 SQL fixture로 데이터를 준비하고, 현재 API 회귀는 전체 migration이 적용된 스키마에서 수행합니다.
+
+`createRun`은 queued 생성만 하고 Lease를 만들지 않습니다. 조회 및 P3-A Claim/Renewal 계약은 유지합니다. `deleteExpiredToolResults`는 별도의 신뢰된 유지보수 경로로 만료 Result만 삭제하며 Run·Step·Lease를 지우지 않습니다. 기존 Runtime 세 함수·Executor에 자동 연결하지 않았고, 내부 synthetic 테스트로만 통합을 검증합니다. Reclaim·Release·Token 교체·Worker·heartbeat·Checkpoint·Replay·Retry·Recovery·Exactly-Once는 구현하지 않았습니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -632,14 +662,14 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A는 Execution Lease Foundation 구현·검토 단계입니다. P3-B 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A는 병합·검증 완료됐고 P3-B는 Lease-Aware Persistence 구현·검토 단계입니다. P3-C 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
-| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A Lease Foundation 구현·검토 중; B 이후 미구현 |
+| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A 완료; P3-B Lease-aware Persistence 구현·검토 중; C 이후 미구현 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |

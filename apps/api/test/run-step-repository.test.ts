@@ -32,12 +32,13 @@ describe('Run Step repository boundaries', () => {
     const { repo, query, release, connect } = setup();
     query.mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ id }] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [{ run_id: id, step_no: 1, result_kind: kind, created_at: timestamp, secret: 'SECRET_SENTINEL' }] });
     const result = await repo.appendRunStep(id, kind);
     expectTypeOf(result).toEqualTypeOf<RunStep | null>();
     expect(result).toEqual({ runId: id, stepNo: 1, resultKind: kind, createdAt: timestamp });
     expect(connect).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls[2]?.[1]).toEqual([id, kind]);
+    expect(query.mock.calls[3]?.[1]).toEqual([id, kind]);
     expect(release).toHaveBeenCalledExactlyOnceWith(false);
   });
   it('exposes only append and list and performs no model or tool calls', async () => {
@@ -61,15 +62,15 @@ describe('Run Step repository boundaries', () => {
     await expect(operation === 'append' ? repo.appendRunStep(id, 'completed') : repo.listRunSteps(id)).rejects.toBe(error);
     expect(release).not.toHaveBeenCalled();
   });
-  it.each([0, 1, 2, 3])('rolls back and releases on failure at append operation %#', async failure => {
+  it.each([0, 1, 2, 3, 4])('rolls back and releases on failure at append operation %#', async failure => {
     const { repo, query, release } = setup();
     const error = new Error('DB failure');
-    const replies = [{ rows: [] }, { rowCount: 1 }, { rows: [{ run_id: id, step_no: 1, result_kind: 'completed', created_at: timestamp }] }];
+    const replies = [{ rows: [] }, { rowCount: 1 }, { rows: [] }, { rows: [{ run_id: id, step_no: 1, result_kind: 'completed', created_at: timestamp }] }];
     for (let i = 0; i < failure; i++) query.mockResolvedValueOnce(replies[i]);
     query.mockRejectedValueOnce(error);
     await expect(repo.appendRunStep(id, 'completed')).rejects.toBe(error);
     expect(query.mock.calls.at(-1)?.[0]).toBe('ROLLBACK');
-    expect(release).toHaveBeenCalledExactlyOnceWith(false);
+    expect(release).toHaveBeenCalledExactlyOnceWith(failure === 4);
     expect(query).toHaveBeenCalledTimes(failure + 2);
   });
   it('discards a connection when rollback fails, retaining the original DB error', async () => {

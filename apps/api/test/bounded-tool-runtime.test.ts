@@ -21,9 +21,9 @@ function setup() {
   const execute = vi.fn(executor.execute);
   const deps = {
     repository: { tryStartRun: vi.fn(async (_id: string) => run as Run | null), findRunById: vi.fn(async (_id: string) => run as Run | null) },
-    continueRecorder: { appendContinuedStepIfRunning: vi.fn<Dependencies['continueRecorder']['appendContinuedStepIfRunning']>().mockResolvedValue({ runId: id, stepNo: 1, resultKind: 'continued', createdAt: run.createdAt }) },
-    toolRecorder: { appendToolSucceededStepIfRunning: vi.fn<Dependencies['toolRecorder']['appendToolSucceededStepIfRunning']>().mockResolvedValue({ runId: id, stepNo: 1, resultKind: 'tool_succeeded', createdAt: run.createdAt }) },
-    finalizer: { tryFinalizeWithStep: vi.fn<Dependencies['finalizer']['tryFinalizeWithStep']>().mockImplementation(async (_, kind) => ({ run: { ...run, status: kind === 'completed' ? 'completed' : 'failed' }, step: { runId: id, stepNo: 2, resultKind: kind, createdAt: run.createdAt } })) },
+    continueRecorder: { appendContinuedStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); }, appendContinuedStepIfRunning: vi.fn<Dependencies['continueRecorder']['appendContinuedStepIfRunning']>().mockResolvedValue({ runId: id, stepNo: 1, resultKind: 'continued', createdAt: run.createdAt }) },
+    toolRecorder: { appendToolSucceededStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); }, appendToolSucceededStepIfRunning: vi.fn<Dependencies['toolRecorder']['appendToolSucceededStepIfRunning']>().mockResolvedValue({ runId: id, stepNo: 1, resultKind: 'tool_succeeded', createdAt: run.createdAt }) },
+    finalizer: { tryFinalizeWithStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); }, tryFinalizeWithStep: vi.fn<Dependencies['finalizer']['tryFinalizeWithStep']>().mockImplementation(async (_, kind) => ({ run: { ...run, status: kind === 'completed' ? 'completed' : 'failed' }, step: { runId: id, stepNo: 2, resultKind: kind, createdAt: run.createdAt } })) },
     executor: { execute },
     decide: vi.fn<Dependencies['decide']>().mockReturnValueOnce(request()).mockReturnValue(final),
   };
@@ -105,9 +105,9 @@ describe('tool Runtime decisions, context and guarded ordering', () => {
       repository: { tryStartRun: async v => { order.push('claim'); return deps.repository.tryStartRun(v); }, findRunById: async v => { order.push('read'); return deps.repository.findRunById(v); } },
       decide: (r, c) => { order.push('decide'); return deps.decide(r, c); },
       executor: { execute: (i, d) => { order.push('execute'); return deps.executor.execute(i, d); } },
-      toolRecorder: { appendToolSucceededStepIfRunning: async i => { order.push('tool-commit'); return deps.toolRecorder.appendToolSucceededStepIfRunning(i); } },
+      toolRecorder: { appendToolSucceededStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); }, appendToolSucceededStepIfRunning: async i => { order.push('tool-commit'); return deps.toolRecorder.appendToolSucceededStepIfRunning(i); } },
       continueRecorder: deps.continueRecorder,
-      finalizer: { tryFinalizeWithStep: async (i, k) => { order.push('finalize'); return deps.finalizer.tryFinalizeWithStep(i, k); } },
+      finalizer: { tryFinalizeWithStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); }, tryFinalizeWithStep: async (i, k) => { order.push('finalize'); return deps.finalizer.tryFinalizeWithStep(i, k); } },
     };
     expect(await execute(wrapped)).toEqual({ kind: 'completed', content: 'done' });
     expect(order).toEqual(['claim','read','decide','read','execute','tool-commit','read','decide','finalize']);

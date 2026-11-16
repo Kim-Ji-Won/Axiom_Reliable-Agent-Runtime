@@ -5,7 +5,7 @@ const id = '12345678-1234-4234-8234-123456789abc';
 const time = new Date();
 function setup() {
   const query = vi.fn(async (sql: string) => {
-    if (sql.startsWith('SELECT')) return { rows: [{ status: 'running' }] };
+    if (sql.startsWith('SELECT status')) return { rows: [{ status: 'running' }] };
     if (sql.startsWith('INSERT')) return { rows: [{ run_id: id, step_no: 2, result_kind: 'continued', created_at: time }] };
     return { rows: [] };
   });
@@ -30,11 +30,11 @@ describe('continued Step recorder', () => {
   it('commits metadata only after locking and reading the parent status', async () => {
     const { recorder, query, release, connect } = setup();
     expect(await recorder.appendContinuedStepIfRunning(id)).toEqual({ runId: id, stepNo: 2, resultKind: 'continued', createdAt: time });
-    expect(query.mock.calls.map(c => c[0].split(' ')[0])).toEqual(['BEGIN', 'SELECT', 'INSERT', 'COMMIT']);
+    expect(query.mock.calls.map(c => c[0].split(' ')[0])).toEqual(['BEGIN', 'SELECT', 'SELECT', 'INSERT', 'COMMIT']);
     expect(query).toHaveBeenCalledWith('SELECT status FROM runs WHERE id = $1 FOR UPDATE', [id]);
     expect(connect).toHaveBeenCalledTimes(1); expect(release).toHaveBeenCalledExactlyOnceWith(false);
   });
-  it.each(['BEGIN', 'SELECT', 'INSERT', 'COMMIT'])('propagates %s failure and releases exactly once', async stage => {
+  it.each(['BEGIN', 'SELECT status', 'SELECT run_id', 'INSERT', 'COMMIT'])('propagates %s failure and releases exactly once', async stage => {
     const { recorder, query, release } = setup();
     const original = query.getMockImplementation()!; const error = new Error('DB_SENTINEL');
     query.mockImplementation(async sql => { if (sql.startsWith(stage)) throw error; return original(sql); });
