@@ -97,7 +97,7 @@ describe('real PostgreSQL execution Lease foundation', () => {
   it.each(['missing','running','completed','failed','same-owner','queued-with-lease'])('claim %s refuses without changing any table', async mode => withSchema(async f => {
     const x = await fresh(f); let id = x.run.id;
     if (mode === 'missing') id = randomUUID();
-    if (mode === 'completed' || mode === 'failed') await createRunRepository(f.client).tryFinishRun(id, mode);
+    if (mode === 'completed' || mode === 'failed') await createAtomicRunFinalizer(f.db).tryFinalizeWithStepWithLease(id, mode === 'completed' ? 'completed' : 'invalid_decision', { ownerId: x.ownerId, leaseToken: x.handle.leaseToken });
     if (mode === 'queued-with-lease') await f.client.query("UPDATE runs SET status='queued' WHERE id=$1", [id]);
     const before = await state(f.client);
     expect(await x.repo.tryClaimRunLease(id, { ownerId: mode === 'same-owner' ? x.ownerId : randomUUID(), leaseSeconds: 30 })).toBeNull();
@@ -111,11 +111,17 @@ describe('real PostgreSQL execution Lease foundation', () => {
   }));
   it.each(['owner','token','missing','expired','completed','failed'])('renewal %s returns null with full data preservation', async mode => withSchema(async f => {
     const x = await fresh(f); if (mode === 'expired') await expire(f.client,x.run.id);
-    if (mode === 'completed' || mode === 'failed') await createRunRepository(f.client).tryFinishRun(x.run.id,mode);
+    if (mode === 'completed' || mode === 'failed') await createAtomicRunFinalizer(f.db).tryFinalizeWithStepWithLease(x.run.id, mode === 'completed' ? 'completed' : 'invalid_decision', { ownerId: x.ownerId, leaseToken: x.handle.leaseToken });
     const before = await state(f.client);
     expect(await x.repo.tryRenewRunLease(mode === 'missing' ? randomUUID() : x.run.id, { ownerId: mode === 'owner' ? randomUUID() : x.ownerId, leaseToken: mode === 'token' ? randomUUID() : x.handle.leaseToken })).toBeNull();
     expect(await state(f.client)).toEqual(before);
     expect((await x.repo.getRunLeaseSnapshot(x.run.id))?.state).toBe(mode === 'expired' ? 'expired' : mode === 'completed' || mode === 'failed' ? 'run_not_running' : 'active');
+  }));
+  it('P3-B blocks tokenless finish/finalizer on a Lease Run without changing data', async () => withSchema(async f => {
+    const x = await fresh(f); const before = await state(f.client);
+    expect(await createRunRepository(f.client).tryFinishRun(x.run.id, 'completed')).toBeNull();
+    expect(await createAtomicRunFinalizer(f.db).tryFinalizeWithStep(x.run.id, 'completed')).toBeNull();
+    expect(await state(f.client)).toEqual(before);
   }));
   it('legacy running without lease cannot renew or gain a lease; missing snapshot is null', async () => withSchema(async f => {
     const r = createRunRepository(f.client); const run = await r.createRun('legacy'); await r.tryStartRun(run.id); const repo = createRunExecutionLeaseRepository(f.db);
@@ -189,7 +195,7 @@ describe('real PostgreSQL execution Lease foundation', () => {
     const before=await state(f.client); const seen:string[]=[];
     expect(await createRunExecutionLeaseRepository(fixedClock(f.db,seen)).tryRenewRunLease(x.run.id,{ownerId:x.ownerId,leaseToken:x.handle.leaseToken})).toBeNull(); expect(await state(f.client)).toEqual(before); expect(seen).toHaveLength(1);
   }));
-  it.each(['finish','renew'])('%s wins lock order with tokenless finalization; terminal Step and lease survive', async winner => withSchema(async f => {
+  it.each(['finish','renew'])('%s wins lock order with credentialed finalization; terminal Step and lease survive', async winner => withSchema(async f => {
     const x = await fresh(f); const reached = barrier(); const gate = barrier(); let firstPid = 0; let secondPid = 0;
     const firstDb = wrap(f.db, async (c, sql, v) => {
       if (sql === 'COMMIT') { firstPid = await pid(c); reached.resolve(); await bounded(gate.promise); }
@@ -197,11 +203,11 @@ describe('real PostgreSQL execution Lease foundation', () => {
     });
     const secondDb = wrap(f.db, async (c, sql, v) => { if (sql.startsWith('BEGIN')) secondPid = await pid(c); return c.query(sql, v); });
     const input = { ownerId: x.ownerId, leaseToken: x.handle.leaseToken };
-    const first = winner === 'finish' ? createAtomicRunFinalizer(firstDb).tryFinalizeWithStep(x.run.id, 'completed') : createRunExecutionLeaseRepository(firstDb).tryRenewRunLease(x.run.id, input);
+    const first = winner === 'finish' ? createAtomicRunFinalizer(firstDb).tryFinalizeWithStepWithLease(x.run.id, 'completed', { ownerId: x.ownerId, leaseToken: x.handle.leaseToken }) : createRunExecutionLeaseRepository(firstDb).tryRenewRunLease(x.run.id, input);
     void first.catch(() => {}); let second: Promise<unknown> | undefined;
     try {
       await bounded(reached.promise);
-      second = winner === 'finish' ? createRunExecutionLeaseRepository(secondDb).tryRenewRunLease(x.run.id, input) : createAtomicRunFinalizer(secondDb).tryFinalizeWithStep(x.run.id, 'completed');
+      second = winner === 'finish' ? createRunExecutionLeaseRepository(secondDb).tryRenewRunLease(x.run.id, input) : createAtomicRunFinalizer(secondDb).tryFinalizeWithStepWithLease(x.run.id, 'completed', { ownerId: x.ownerId, leaseToken: x.handle.leaseToken });
       void second.catch(() => {});
       await waitFor(async () => secondPid !== 0 && (await f.client.query('SELECT $1::int=ANY(pg_blocking_pids($2)) AS blocked', [firstPid, secondPid])).rows[0].blocked, 'finish/renew wait');
       expect(firstPid).not.toBe(secondPid); gate.resolve(); expect(await first).not.toBeNull();
@@ -294,7 +300,7 @@ describe('Lease database constraints, failure atomicity and migration safety',()
     expect((await state(f.client)).constraints).toEqual(before.constraints);
   }));
   it.each(['active','expired','terminal'])('nonempty %s down preserves data, constraints and full migration history',async mode=>withSchema(async f=>{
-    const x=await fresh(f);if(mode==='expired')await expire(f.client,x.run.id);if(mode==='terminal')await createAtomicRunFinalizer(f.db).tryFinalizeWithStep(x.run.id,'completed');
+    const x=await fresh(f);if(mode==='expired')await expire(f.client,x.run.id);if(mode==='terminal')await createAtomicRunFinalizer(f.db).tryFinalizeWithStepWithLease(x.run.id,'completed',{ownerId:x.ownerId,leaseToken:x.handle.leaseToken});
     // Seed an independently approved Safe Result fixture to prove down preserves it.
     const other=await createRunRepository(f.client).createRun('other');await createRunRepository(f.client).tryStartRun(other.id);
     await f.client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES ($1,1,'tool_succeeded')",[other.id]);

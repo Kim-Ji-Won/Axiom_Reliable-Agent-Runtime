@@ -10,6 +10,7 @@ function setup(kind: FinalizationResultKind = 'completed') {
   const run = { id, task: 'TASK_SENTINEL', status, createdAt: time };
   const step = { runId: id, stepNo: 3, resultKind: kind, createdAt: time };
   const query = vi.fn().mockImplementation(async (sql: string) => {
+    if (sql.startsWith('SELECT status')) return { rows: [{ status: 'running' }] };
     if (sql.startsWith('UPDATE')) return { rows: [{ id, task: run.task, status, created_at: time, extra: 'HIDDEN' }] };
     if (sql.startsWith('INSERT')) return { rows: [{ run_id: id, step_no: 3, result_kind: kind, created_at: time, extra: 'HIDDEN' }] };
     return { rows: [] };
@@ -38,18 +39,18 @@ describe('atomic Run finalizer', () => {
     const { finalizer, query, release, connect, run, step } = setup(kind);
     expect(await finalizer.tryFinalizeWithStep(id, kind)).toEqual({ run, step });
     expect(connect).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls.map(c => c[0].split(' ')[0])).toEqual(['BEGIN', 'UPDATE', 'INSERT', 'COMMIT']);
+    expect(query.mock.calls.map(c => c[0].split(' ')[0])).toEqual(['BEGIN', 'SELECT', 'SELECT', 'UPDATE', 'INSERT', 'COMMIT']);
     expect(query.mock.calls[0]![0]).toBe('BEGIN ISOLATION LEVEL READ COMMITTED');
-    expect(query.mock.calls[1]![0]).toContain("WHERE id = $1 AND status = 'running'");
-    expect(query.mock.calls[1]![1]).toEqual([id, run.status]);
-    expect(query.mock.calls[2]![1]).toEqual([id, kind]);
+    expect(query.mock.calls[3]![0]).toContain("WHERE id = $1 AND status = 'running'");
+    expect(query.mock.calls[3]![1]).toEqual([id, run.status]);
+    expect(query.mock.calls[4]![1]).toEqual([id, kind]);
     expect(release).toHaveBeenCalledExactlyOnceWith(false);
   });
-  it('commits a zero-row UPDATE without inserting a Step', async () => {
+  it('commits a missing parent without updating or inserting a Step', async () => {
     const { finalizer, query, release } = setup();
     query.mockResolvedValue({ rows: [] });
     expect(await finalizer.tryFinalizeWithStep(id, 'completed')).toBeNull();
-    expect(query.mock.calls.map(c => c[0].split(' ')[0])).toEqual(['BEGIN', 'UPDATE', 'COMMIT']);
+    expect(query.mock.calls.map(c => c[0].split(' ')[0])).toEqual(['BEGIN', 'SELECT', 'COMMIT']);
     expect(release).toHaveBeenCalledExactlyOnceWith(false);
   });
   it('does not resolve or release until COMMIT acknowledges success', async () => {
@@ -68,7 +69,7 @@ describe('atomic Run finalizer', () => {
     expect(resolved).toBe(true);
     expect(release).toHaveBeenCalledExactlyOnceWith(false);
   });
-  it.each(['BEGIN', 'UPDATE', 'INSERT', 'COMMIT'])('propagates %s failure, rolls back, and never retries', async stage => {
+  it.each(['BEGIN', 'SELECT status', 'SELECT run_id', 'UPDATE', 'INSERT', 'COMMIT'])('propagates %s failure, rolls back, and never retries', async stage => {
     const { finalizer, query, release } = setup();
     const original = query.getMockImplementation()!;
     const error = new Error('DB_SENTINEL');

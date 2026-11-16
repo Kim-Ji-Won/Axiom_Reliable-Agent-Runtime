@@ -42,10 +42,14 @@ export function createRunRepository(db: Pick<Pool, 'query'>) {
       if (!runIdSchema.safeParse(id).success) {
         throw new InvalidRunInputError('Run ID must be a UUID');
       }
-      // PostgreSQL rechecks the predicate after waiting on a concurrent updater.
+      // Query-only Pool/PoolClient API. Claim alone creates a Lease together with
+      // queued -> running; no supported attach/delete/requeue exists. A Claim
+      // that wins the row lock breaks this UPDATE's rechecked queued condition.
+      // Do not generalize this exception to arbitrary Step writes or reclaim.
       const result = await db.query<RunRow>(
         `UPDATE runs SET status = 'running'
          WHERE id = $1 AND status = 'queued'
+           AND NOT EXISTS (SELECT 1 FROM run_execution_leases WHERE run_id = runs.id)
          RETURNING id, task, status, created_at`, [id],
       );
       return result.rows[0] ? toRun(result.rows[0]) : null;
@@ -54,9 +58,12 @@ export function createRunRepository(db: Pick<Pool, 'query'>) {
       if (!runIdSchema.safeParse(id).success || !runOutcomeSchema.safeParse(outcome).success) {
         throw new InvalidRunInputError('Invalid Run ID or outcome');
       }
+      // A snapshot-queued Run cannot finish; a legacy-running Run cannot gain
+      // a Lease through supported APIs. Existing Lease rows always deny this path.
       const result = await db.query<RunRow>(
         `UPDATE runs SET status = $2
          WHERE id = $1 AND status = 'running'
+           AND NOT EXISTS (SELECT 1 FROM run_execution_leases WHERE run_id = runs.id)
          RETURNING id, task, status, created_at`, [id, outcome],
       );
       return result.rows[0] ? toRun(result.rows[0]) : null;

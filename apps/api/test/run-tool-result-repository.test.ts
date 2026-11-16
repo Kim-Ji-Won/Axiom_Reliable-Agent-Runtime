@@ -30,7 +30,7 @@ describe('atomic safe result repository',()=>{
   it('orders parent lock, both inserts and COMMIT; stores only safe scalars',async()=>{
     const {repo,query,release}=setup();const saved=await repo.appendToolSucceededStepWithSafeResultIfRunning(id,'summary',outcome);
     expect(saved).toHaveProperty('result.safeResult',{schemaVersion:1,status:'ok',itemCount:3});
-    expect(query.mock.calls.map(c=>c[0].split(' ')[0])).toEqual(['BEGIN','SELECT','INSERT','INSERT','COMMIT']);
+    expect(query.mock.calls.map(c=>c[0].split(' ')[0])).toEqual(['BEGIN','SELECT','SELECT','INSERT','INSERT','COMMIT']);
     expect(JSON.stringify(query.mock.calls)).not.toContain('SECRET');expect(release).toHaveBeenCalledExactlyOnceWith(false);
   });
   it.each(['BEGIN','SELECT status','INSERT INTO run_steps','INSERT INTO run_tool_results','COMMIT'])('rolls back %s failure, releases once, never retries',async stage=>{

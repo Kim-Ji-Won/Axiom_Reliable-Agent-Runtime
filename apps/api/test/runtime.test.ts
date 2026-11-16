@@ -20,7 +20,7 @@ function setup(decision: RuntimeDependencies['decide'] = cases[0].decide) {
     repository: {
       tryStartRun: vi.fn<RuntimeDependencies['repository']['tryStartRun']>().mockResolvedValue({ ...running }),
     },
-    finalizer: {
+    finalizer: { tryFinalizeWithStepWithLease: () => { throw new Error('Legacy Runtime must not call Lease-aware writer'); },
       tryFinalizeWithStep: vi.fn<RuntimeDependencies['finalizer']['tryFinalizeWithStep']>().mockImplementation(async (_, kind) => ({
         run: { ...running, status: kind === 'completed' ? 'completed' : 'failed' },
         step: { runId: id, stepNo: 1, resultKind: kind, createdAt: running.createdAt },

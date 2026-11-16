@@ -53,7 +53,8 @@ describe('real PostgreSQL persistence', () => {
     const repo = createRunRepository(client);
     const queued = await repo.createRun('old queued');
     const running = await repo.createRun('old running');
-    await repo.tryStartRun(running.id);
+    // Historical schema #2 has no Lease table; seed old data directly.
+    await client.query("UPDATE runs SET status='running' WHERE id=$1", [running.id]);
     const before = (await client.query('SELECT * FROM runs ORDER BY id')).rows;
     expect(await migrate('test', 'up', schema)).toHaveLength(6);
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
