@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P3-B — Lease-Aware Persistence 구현·검토 중 (미병합). P3-A 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P3-C — Durable Checkpoint & Budget 구현·검토 중 (미커밋·미병합). P3-A/B 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -60,7 +60,7 @@ Axiom/
 │   ├── src/
 │   │   ├── app.ts              # Fastify 앱 구성, health 및 Run routes
 │   │   ├── server.ts           # 서버 기동과 프로세스 종료
-│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result/Lease repository 및 내부 Lease write guard
+│   │   ├── persistence/        # DB pool, Run/Step, finalizer, continue/tool recorder, safe result/Lease/Progress repository 및 내부 Lease write guard
 │   │   ├── runtime/            # one-shot / bounded / bounded-tool decisions
 │   │   ├── smoke/public-repo.ts # 명시적 opt-in 공개 읽기 smoke (자동 실행 없음)
 │   │   └── tools/              # Registry / Snapshot / Preflight / Outcome / Executors / Result Policy
@@ -593,9 +593,9 @@ Handle은 **COMMIT 응답 확인 뒤에만** 반환합니다. 조건 불충족(n
 
 Unit 테스트는 입력·행 검증·잠금 순서·COMMIT 전 비반환·연결 폐기·Token 비노출을 확인합니다. `test:db`는 실행별 `axiom_test` schema에서 독립 backend Claim/Legacy/종료 경합, 실제 잠금 대기 중 만료, 제약·실패 원자성·down 보호를 검증합니다. 마이크로초 경계는 **실제 repository SQL의 clock_timestamp() 표현식만** 테스트 DB 시계로 치환해 검사하며 production now override는 없습니다. COMMIT 후 응답 유실은 모사이며 실제 네트워크 단절 실험이 아닙니다. P2-F 회귀는 mock·소유 loopback만 사용하고 추가 Live 요청은 없습니다.
 
-## Lease-Aware Persistence · 쓰기 경계 보호 (P3-B 구현·검토 중)
+## Lease-Aware Persistence · 쓰기 경계 보호 (P3-B 완료)
 
-Issue #33의 로컬 구현이며 아직 제출·병합하지 않았습니다. **Lease existence selects the write protocol. Expiry never falls back to legacy writes.** Lease의 존재 자체가 쓰기 경로를 선택합니다. expired·terminal·방어용 queued+Lease도 Legacy 쓰기를 열지 않습니다.
+Issue #33은 PR #34로 병합됐으며 main 전체 검증을 완료했습니다. **Lease existence selects the write protocol. Expiry never falls back to legacy writes.** Lease의 존재 자체가 쓰기 경로를 선택합니다. expired·terminal·방어용 queued+Lease도 Legacy 쓰기를 열지 않습니다.
 
 | 지원 API | Lease 없음 | Lease 있음 |
 | --- | --- | --- |
@@ -621,6 +621,36 @@ Lease-aware credential은 정확히 `{ ownerId, leaseToken }`인 UUID 문자열�
 보호 범위는 **수정된 지원 Repository API**입니다. raw SQL·DB 소유자·악성 호스트·구버전 Writer·혼합 버전 배포·외부 서비스까지 강제하는 보안 경계가 아닙니다. 필요한 migration #1~8이 없으면 인프라 오류이며 보호를 생략하지 않습니다. 과거 migration 테스트는 최소 SQL fixture로 데이터를 준비하고, 현재 API 회귀는 전체 migration이 적용된 스키마에서 수행합니다.
 
 `createRun`은 queued 생성만 하고 Lease를 만들지 않습니다. 조회 및 P3-A Claim/Renewal 계약은 유지합니다. `deleteExpiredToolResults`는 별도의 신뢰된 유지보수 경로로 만료 Result만 삭제하며 Run·Step·Lease를 지우지 않습니다. 기존 Runtime 세 함수·Executor에 자동 연결하지 않았고, 내부 synthetic 테스트로만 통합을 검증합니다. Reclaim·Release·Token 교체·Worker·heartbeat·Checkpoint·Replay·Retry·Recovery·Exactly-Once는 구현하지 않았습니다.
+
+## Durable Checkpoint & Budget · 보수적 진행 기록 (P3-C 구현·검토 중)
+
+Issue #35의 로컬 구현이며 아직 staging·commit·PR·병합하지 않았습니다. `createRunExecutionProgressRepository(db)`는 전용 connection을 제공하는 내부 DB 의존성을 받습니다. 기존 Runtime의 Decision/Tool 예산은 여전히 메모리에서 관리하며 새 Ledger를 자동 호출하지 않습니다. `run_steps`는 전체 Model/Tool 호출 로그가 아니므로 기존 Step에서 예산을 역산하거나 backfill하지 않습니다.
+
+**A checkpoint watermark is evidence of observed committed metadata, not permission to replay.**
+
+**A budget reservation is conservative accounting, not proof of a completed call.**
+
+**Lease existence selects the write protocol. Expiry never falls back to legacy writes.**
+
+| 내부 API | 계약 |
+| --- | --- |
+| `initializeProgress(runId, credentials, { maxDecisions, maxToolAttempts })` | 유효한 running Lease, Progress·Step·Safe Result 모두 없음. version 0, watermark null, 예약 0으로 최초 1행만 생성. 재초기화·backfill 금지. |
+| `tryReserveDecision(runId, credentials, expectedVersion)` | version 일치·잔여 Decision 예산에서 예약과 version을 각각 +1. |
+| `tryReserveToolAttempt(runId, credentials, expectedVersion)` | version 일치·잔여 Tool 예산 및 `toolAttemptsReserved < decisionsReserved`에서 예약과 version을 각각 +1. |
+| `tryConfirmCommittedStep(runId, credentials, { expectedVersion, stepNo })` | 같은 Run의 COMMIT된 `continued` 또는 `tool_succeeded` Step을 정확히 다음 번호로만 확인. watermark 갱신, version +1; Step/Result·예산은 변경하지 않음. |
+| `getProgressSnapshot(runId)` | 한 statement의 읽기 전용 관찰. Progress가 없으면 null; 있으면 Run 상태·Lease 관찰 상태·최대 Step·정합성 진단 포함. |
+
+입력은 UUID Run/Owner/Token과 정확한 own data 필드만 허용합니다. Credential은 `{ ownerId, leaseToken }`, Decision 상한 1~5, Tool 상한 0~1, expectedVersion 0~2,147,483,647, stepNo 1~2,147,483,647입니다. Proxy·accessor·coercion·추가 override를 실행하지 않고 연결 전에 고정 입력 오류로 거부하며, 첫 await 전에 값을 캡처합니다. 정상 형식의 조건 불충족은 null, DB 오류는 reject입니다.
+
+쓰기마다 전용 client의 READ COMMITTED 트랜잭션에서 **Run → Lease → Progress** 잠금을 완료한 뒤 첫 DML의 단일 `clock_timestamp()`로 판정합니다. 기존 P3-B Guard의 running·Owner/Token·미만료(`expires_at > t`)·시계 역행 방지·유한 시각 검증을 재사용합니다. 갱신 시 `t >= updated_at`도 요구합니다. version CAS와 INTEGER overflow 차단을 같은 UPDATE에 적용하며, COMMIT 응답 확인 후에만 불변 메타데이터를 반환합니다. SQL 실패는 rollback, COMMIT 응답 불확실·rollback 실패는 연결을 한 번 폐기하고 자동 재시도하지 않습니다. 권한 진입 후 COMMIT이 지연되면 반환 시 이미 Lease가 만료됐을 수 있습니다.
+
+Migration #9의 `run_execution_progress`는 run_id PK/FK, schema_version=1, checkpoint_version, nullable last_confirmed_step_no, 두 예산 상한·예약 카운터, DB 생성 created_at/updated_at만 저장합니다. 모든 필수 필드는 NOT NULL, 예산 범위·예약 상한·Tool 예약 ≤ Decision 예약·유한 시각·updated_at ≥ created_at을 DB가 강제합니다. `(run_id, last_confirmed_step_no)`는 실제 Step 복합 FK이며 CASCADE 삭제하지 않습니다. 원본 Task/Prompt/Output/Error·임의 JSON/TEXT·Hash·Credential/Token은 저장하지 않습니다. UTC timestamp 반환은 microsecond 문자열이므로 Date 객체를 통한 변경도 없습니다. #1~8은 보존합니다. Down은 runs → Lease → Step → Progress 테이블 잠금 후 한 행이라도 있으면 active/expired/terminal/예산 소진 여부와 무관하게 거부하고 데이터·제약·이력을 보존합니다. 빈 Down과 Re-Up만 허용합니다.
+
+Snapshot의 `diagnostic` 우선순위는 **inconsistent → steps_ahead → aligned**입니다. Step 순번에 구멍이 있거나 watermark가 관찰 최대값보다 크거나 확인 대상 Step이 없거나 비종료 종류가 아니면 inconsistent, 그 외 최대 Step이 watermark(null은 0)보다 크면 steps_ahead, 같으면 aligned입니다. Lease 관찰은 missing → run_not_running → invalid_clock → expired → active 순서로 판단합니다. Token·Owner·Task·원본 Step·Tool Output·실행 허가 필드는 반환하지 않습니다. **aligned/active는 resumable 또는 후속 쓰기 권한이 아닙니다.** Terminal Run도 관찰할 수 있지만 확인 API는 terminal Step을 허용하지 않습니다.
+
+Step COMMIT과 watermark COMMIT은 별개입니다. Step #2 저장 후 프로세스가 종료되면 watermark #1과 `steps_ahead`가 남을 수 있으며 조회는 이를 수정하거나 재확인하지 않습니다. Terminal Finalizer와 Progress도 원자적으로 결합하지 않았습니다. 예산 예약은 실제 호출의 시작·성공·완료 증명이 아니고, 실패·응답 유실·crash 후 환불하지 않습니다. Tool 결과가 불명확할 때 재호출하면 외부 부작용이 중복될 수 있습니다. No Resume / No Retry / No Replay / No Recovery이며 Exactly-Once를 구현하지 않았습니다. 직접 SQL·구버전 writer·외부 서비스의 부작용까지 보호하지 않습니다. HTTP·Runtime·Executor·Worker·heartbeat·실제 Model/Tool 호출 통합은 후속 범위입니다.
+
+신규 검증은 `apps/api/test/execution-progress.test.ts`와 `apps/api/test/db/execution-progress.test.ts`에 있으며 기존 `npm test` / `npm run test:db`에 포함됩니다. 격리 `axiom_test` schema에서 synthetic P3-A Claim → 예약 → P3-B Step COMMIT → 확인 흐름, 독립 backend의 CAS·잠금·renewal 경합, 시간 경계, 실패 원자성, migration 보호를 검사합니다. 정확한 microsecond 경계는 실제 SQL의 단일 clock 표현식만 치환하며 실제 DB 시계 기반 lock-wait와 구분합니다. COMMIT 후 응답 유실은 모사이며 실제 네트워크 단절 실험이 아닙니다. 기존 HTTP 서버 재시작 회귀도 계속 실행합니다. 추가 live smoke·외부 Tool/LLM 요청은 하지 않습니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -662,14 +692,14 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A는 병합·검증 완료됐고 P3-B는 Lease-Aware Persistence 구현·검토 단계입니다. P3-C 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A/B는 병합·검증 완료됐고 P3-C는 Durable Checkpoint & Budget 구현·검토 단계입니다. P3-D 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
-| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A 완료; P3-B Lease-aware Persistence 구현·검토 중; C 이후 미구현 |
+| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A/B 완료; P3-C Progress Ledger 구현·검토 중; D 이후 미구현 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |

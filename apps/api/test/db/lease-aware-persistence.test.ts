@@ -138,6 +138,7 @@ describe('write protocol matrix', () => {
     const after=await snapshot(f.client);expect(after.runs).toEqual(before.runs);expect(after.steps).toEqual(before.steps);expect(after.leases).toEqual(before.leases);
   }));
   it('schema mismatch rejects instead of silently bypassing Lease protection', async () => withSchema(async f => {
+    await migrate('test','down',f.schema); // empty Progress table (#9)
     const r=await createRunRepository(f.client).createRun('old schema');await migrate('test','down',f.schema);
     await expect(createRunRepository(f.client).tryStartRun(r.id)).rejects.toMatchObject({code:'42P01'});
     await expect(createRunStepRepository(f.db).appendRunStep(r.id,'completed')).rejects.toMatchObject({code:'42P01'});

@@ -292,14 +292,17 @@ describe('Lease database constraints, failure atomicity and migration safety',()
     expect(await state(f.client)).toEqual(before);
   }));
   it('migration eight up/up, empty down and re-up preserve seven earlier migrations and rows',async()=>withSchema(async f=>{
-    const run=await createRunRepository(f.client).createRun('preserved');const before=await state(f.client);expect(before.history).toHaveLength(8);
-    expect(await migrate('test','up',f.schema)).toHaveLength(0);expect(await migrate('test','down',f.schema)).toHaveLength(1);
+    const run=await createRunRepository(f.client).createRun('preserved');const before=await state(f.client);expect(before.history).toHaveLength(9);
+    expect(await migrate('test','up',f.schema)).toHaveLength(0);
+    await migrate('test','down',f.schema); // empty Progress table (#9)
+    expect(await migrate('test','down',f.schema)).toHaveLength(1);
     expect((await f.client.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(before.history.slice(0,7));
     expect((await f.client.query("SELECT to_regclass('run_execution_leases') AS table")).rows[0].table).toBeNull();
-    expect(await migrate('test','up',f.schema)).toHaveLength(1);expect(await createRunRepository(f.client).findRunById(run.id)).toEqual(run);
+    expect(await migrate('test','up',f.schema)).toHaveLength(2);expect(await createRunRepository(f.client).findRunById(run.id)).toEqual(run);
     expect((await state(f.client)).constraints).toEqual(before.constraints);
   }));
   it.each(['active','expired','terminal'])('nonempty %s down preserves data, constraints and full migration history',async mode=>withSchema(async f=>{
+    await migrate('test','down',f.schema); // empty Progress table (#9)
     const x=await fresh(f);if(mode==='expired')await expire(f.client,x.run.id);if(mode==='terminal')await createAtomicRunFinalizer(f.db).tryFinalizeWithStepWithLease(x.run.id,'completed',{ownerId:x.ownerId,leaseToken:x.handle.leaseToken});
     // Seed an independently approved Safe Result fixture to prove down preserves it.
     const other=await createRunRepository(f.client).createRun('other');await createRunRepository(f.client).tryStartRun(other.id);
@@ -308,6 +311,7 @@ describe('Lease database constraints, failure atomicity and migration safety',()
     const before=await state(f.client);await expect(migrate('test','down',f.schema)).rejects.toThrow('Cannot drop nonempty run_execution_leases');expect(await state(f.client)).toEqual(before);
   }));
   it('in-flight Claim holds parent then Lease; down waits and refuses after Claim commits',async()=>withSchema(async f=>{
+    await migrate('test','down',f.schema); // empty Progress table (#9)
     const run=await createRunRepository(f.client).createRun('migration race');let reached!:()=>void;let release!:()=>void;const entered=new Promise<void>(r=>{reached=r;});const gate=new Promise<void>(r=>{release=r;});let holderPid=0;const releases:boolean[]=[];
     const repo=createRunExecutionLeaseRepository(wrap(f.db,async(c,sql,v)=>{if(sql==='COMMIT'){holderPid=await pid(c);reached();await bounded(gate);}return c.query(sql,v);},releases));
     const claim=repo.tryClaimRunLease(run.id,{ownerId:randomUUID(),leaseSeconds:30});void claim.catch(()=>{});let down:Promise<unknown>|undefined;

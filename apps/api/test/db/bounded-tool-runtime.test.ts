@@ -316,7 +316,8 @@ describe('real PostgreSQL bounded tool Runtime', () => {
   }));
 
   it('migration six preserves old data, safely downs and reapplies without changing Run constraints', async () => withSchema(async ({ schema, client, db }) => {
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(8);
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(9);
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test','down',schema); // safe result table; exercise migration six
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(6);
@@ -325,33 +326,36 @@ describe('real PostgreSQL bounded tool Runtime', () => {
     await client.query("UPDATE runs SET status='running' WHERE id=$1", [created.id]);
     await client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,'continued')", [created.id]);
     const before = await snapshot(client);
-    expect(await migrate('test','up',schema)).toHaveLength(3); expect(await migrate('test','up',schema)).toHaveLength(0);
+    expect(await migrate('test','up',schema)).toHaveLength(4); expect(await migrate('test','up',schema)).toHaveLength(0);
     const after = await snapshot(client); expect(after.runs).toEqual(before.runs); expect(after.steps).toEqual(before.steps); expect(after.history.slice(0,5)).toEqual(before.history);
     expect(after.constraints.filter(c => c.conname === 'run_steps_result_binding')).toEqual([{ conname: 'run_steps_result_binding', definition: 'UNIQUE (run_id, step_no, result_kind)' }]);
     expect(after.constraints.filter(c => !['run_steps_result_kind_check', 'run_steps_result_binding'].includes(c.conname))).toEqual(before.constraints.filter(c => !['run_steps_result_kind_check', 'run_steps_result_binding'].includes(c.conname)));
     await expect(client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,2,'unknown')",[created.id])).rejects.toMatchObject({ code: '23514' });
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     expect(await migrate('test','down',schema)).toHaveLength(1); // safe result table
     expect(await migrate('test','down',schema)).toHaveLength(1); expect(await snapshot(client)).toEqual(before);
     for (const kind of ['tool_succeeded','tool_failed','tool_request_rejected','tool_execution_limit_exceeded']) {
       await expect(client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,2,$2)',[created.id,kind])).rejects.toMatchObject({ code: '23514' });
     }
-    expect(await migrate('test','up',schema)).toHaveLength(3);
+    expect(await migrate('test','up',schema)).toHaveLength(4);
   }));
 
   it.each(['tool_succeeded','tool_failed','tool_request_rejected','tool_execution_limit_exceeded'] as const)('refuses down with %s preserving data, constraints and history', async kind => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test','down',schema); // exercise migration six guard
-    const created = await createRunRepository(client).createRun('down guard'); // Historical schema-six fixture; API regression runs on all eight migrations.
+    const created = await createRunRepository(client).createRun('down guard'); // Historical schema-six fixture; API regression runs on all nine migrations.
     await client.query('UPDATE runs SET status=$2 WHERE id=$1', [created.id,kind === 'tool_succeeded' ? 'running' : 'failed']);
     await client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,$2)', [created.id,kind]);
     const before = await snapshot(client);
     await expect(migrate('test','down',schema)).rejects.toThrow('Cannot remove recorded tool Step kinds');
-    expect(await snapshot(client)).toEqual(before); expect(await migrate('test','up',schema)).toHaveLength(2);
+    expect(await snapshot(client)).toEqual(before); expect(await migrate('test','up',schema)).toHaveLength(3);
     expect(await migrate('test','up',schema)).toHaveLength(0);
   }));
 
   it('down waits for a concurrent Tool Step INSERT and preserves the committed row and migration history', async () => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test','down',schema); // exercise migration six lock
     const created = await createRunRepository(client).createRun('migration lock'); const writer = await db.connect();
