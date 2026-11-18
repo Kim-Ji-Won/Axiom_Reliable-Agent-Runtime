@@ -38,12 +38,13 @@ afterAll(async () => {
 
 describe('real PostgreSQL persistence', () => {
   it('migrates an empty schema, preserves old rows, restores prior constraints, and reapplies', async () => {
-    expect(await migrate('test', 'up', schema)).toHaveLength(8);
+    expect(await migrate('test', 'up', schema)).toHaveLength(9);
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
-    for (let i = 0; i < 8; i++) expect(await migrate('test', 'down', schema)).toHaveLength(1);
+    for (let i = 0; i < 9; i++) expect(await migrate('test', 'down', schema)).toHaveLength(1);
     expect((await client.query("SELECT to_regclass('runs') AS name")).rows[0].name).toBeNull();
     expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(0);
-    expect(await migrate('test', 'up', schema)).toHaveLength(8);
+    expect(await migrate('test', 'up', schema)).toHaveLength(9);
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // safe result table
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // tool Step kinds
@@ -56,8 +57,9 @@ describe('real PostgreSQL persistence', () => {
     // Historical schema #2 has no Lease table; seed old data directly.
     await client.query("UPDATE runs SET status='running' WHERE id=$1", [running.id]);
     const before = (await client.query('SELECT * FROM runs ORDER BY id')).rows;
-    expect(await migrate('test', 'up', schema)).toHaveLength(6);
+    expect(await migrate('test', 'up', schema)).toHaveLength(7);
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // safe result table
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // tool Step kinds
@@ -71,7 +73,7 @@ describe('real PostgreSQL persistence', () => {
         .rejects.toMatchObject({ code: '23514' });
     }
     expect(await repo.findRunById(queued.id)).toEqual(queued);
-    expect(await migrate('test', 'up', schema)).toHaveLength(6);
+    expect(await migrate('test', 'up', schema)).toHaveLength(7);
   });
 
   it('creates and reads a Run with DB time, preserving original text', async () => {
@@ -174,6 +176,7 @@ describe('real PostgreSQL persistence', () => {
     const repo = createRunRepository(client);
     const run = await repo.createRun('rollback safety');
     expect((await repo.tryStartRun(run.id))!.status).toBe('running');
+    await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // safe result table
     expect(await migrate('test', 'down', schema)).toHaveLength(1); // tool Step kinds
@@ -185,7 +188,7 @@ describe('real PostgreSQL persistence', () => {
     await expect(migrate('test', 'down', schema)).rejects.toThrow();
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before);
     expect((await client.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(history);
-    expect(await migrate('test', 'up', schema)).toHaveLength(6);
+    expect(await migrate('test', 'up', schema)).toHaveLength(7);
     const next = await repo.createRun('still queued by default');
     expect(next.status).toBe('queued');
     expect((await repo.tryStartRun(next.id))!.status).toBe('running');
@@ -262,6 +265,7 @@ describe('real PostgreSQL persistence', () => {
       const run = await repo.createRun('rollback terminal safety');
       await repo.tryStartRun(run.id);
       await repo.tryFinishRun(run.id, outcome);
+      await migrate('test', 'down', isolated); // empty Progress table (#9)
       await migrate('test', 'down', isolated); // empty execution Lease table (#8)
       expect(await migrate('test', 'down', isolated)).toHaveLength(1); // safe result table
       expect(await migrate('test', 'down', isolated)).toHaveLength(1); // tool Step kinds
@@ -275,7 +279,7 @@ describe('real PostgreSQL persistence', () => {
       expect((await connection.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(rows);
       expect((await connection.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(history);
       expect((await constraints()).rows).toEqual(beforeConstraints);
-      expect(await migrate('test', 'up', isolated)).toHaveLength(5);
+      expect(await migrate('test', 'up', isolated)).toHaveLength(6);
     } finally {
       try { if (created) await connection.query(`DROP SCHEMA "${isolated}" CASCADE`); }
       finally { connection.release(); }
