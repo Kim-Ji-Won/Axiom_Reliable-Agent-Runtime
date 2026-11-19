@@ -249,3 +249,45 @@ it('keeps credentials and source errors out of the result and console', async ()
     for (const sink of sinks) expect(sink).not.toHaveBeenCalled();
   } finally { for (const sink of sinks) sink.mockRestore(); }
 });
+
+it.each([
+  { slot: 1, stepNo: 2, accepted: false },
+  { slot: 2, stepNo: 1, accepted: false },
+  { slot: 2, stepNo: 3, accepted: false },
+  { slot: 2, stepNo: 2, accepted: true },
+])('checks terminal Step #$stepNo at slot $slot', async ({ slot, stepNo, accepted }) => {
+  const deps = fixture();
+  deps.decide.mockReturnValue({ kind: 'final', content: 'ok' });
+  if (slot === 2) deps.decide.mockReturnValueOnce({ kind: 'continue' });
+  deps.tryFinalizeWithStepWithLease.mockResolvedValueOnce({
+    run: { ...run, status: 'completed' },
+    step: { runId: id, stepNo, resultKind: 'completed', createdAt: date },
+  });
+
+  const result = await execute(id, deps, options);
+  expect(result).toEqual(accepted ? { kind: 'completed', content: 'ok' } : { kind: 'finalize_conflict' });
+  expect(deps.decide).toHaveBeenCalledTimes(slot);
+  expect(deps.tryReserveDecision).toHaveBeenCalledTimes(slot);
+  expect(deps.tryFinalizeWithStepWithLease).toHaveBeenCalledTimes(1);
+  expect(deps.tryConfirmCommittedStep.mock.calls.map(call => call[2].stepNo)).toEqual(slot === 2 ? [1] : []);
+});
+
+it.each([
+  { metadata: 'different task', task: 'another valid task', offsetMs: 0, accepted: false },
+  { metadata: 'different timestamp', task: run.task, offsetMs: 1, accepted: false },
+  { metadata: 'same timestamp in a distinct Date', task: run.task, offsetMs: 0, accepted: true },
+])('checks terminal Run metadata: $metadata', async ({ task, offsetMs, accepted }) => {
+  const deps = fixture(1);
+  deps.decide.mockReturnValue({ kind: 'final', content: 'ok' });
+  const createdAt = new Date(date.getTime() + offsetMs);
+  deps.tryFinalizeWithStepWithLease.mockResolvedValueOnce({
+    run: { ...run, status: 'completed', task, createdAt },
+    step: { runId: id, stepNo: 1, resultKind: 'completed', createdAt: date },
+  });
+
+  const result = await execute(id, deps, { ...options, maxDecisions: 1 });
+  expect(result).toEqual(accepted ? { kind: 'completed', content: 'ok' } : { kind: 'finalize_conflict' });
+  expect(deps.decide).toHaveBeenCalledTimes(1);
+  expect(deps.tryFinalizeWithStepWithLease).toHaveBeenCalledTimes(1);
+  expect(deps.tryConfirmCommittedStep).not.toHaveBeenCalled();
+});

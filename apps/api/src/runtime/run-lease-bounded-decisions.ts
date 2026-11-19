@@ -149,9 +149,9 @@ export async function runLeaseBoundedDecisions(runId: string, dependencies: Leas
     const finished = await acknowledged(tryFinalizeWithStepWithLease(runId, result.kind, credentials));
     if (!finished || !dataRecord(finished, ['run', 'step']) ||
         !validRun(finished.run, runId, result.kind === 'completed' ? 'completed' : 'failed') ||
+        finished.run.task !== row.task || Date.prototype.getTime.call(finished.run.createdAt) !== Date.prototype.getTime.call(row.createdAt) ||
         !dataRecord(finished.step, ['runId', 'stepNo', 'resultKind', 'createdAt']) || finished.step.runId !== runId ||
-        !validDate(finished.step.createdAt) || finished.step.resultKind !== result.kind || !Number.isSafeInteger(finished.step.stepNo) ||
-        finished.step.stepNo < slot) return { kind: 'finalize_conflict' };
+        !validDate(finished.step.createdAt) || finished.step.resultKind !== result.kind || finished.step.stepNo !== slot) return { kind: 'finalize_conflict' };
     return result;
   }
   throw new Error('Unexpected lease decision state');
