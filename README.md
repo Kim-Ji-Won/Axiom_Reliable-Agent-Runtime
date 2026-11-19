@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P3-C — Durable Checkpoint & Budget 구현·검토 중 (미커밋·미병합). P3-A/B 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P3-D — Trusted Lease-Bound Decision Orchestration 로컬 구현·검토 중 (커밋·PR 전). P3-A/B/C 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -622,9 +622,9 @@ Lease-aware credential은 정확히 `{ ownerId, leaseToken }`인 UUID 문자열�
 
 `createRun`은 queued 생성만 하고 Lease를 만들지 않습니다. 조회 및 P3-A Claim/Renewal 계약은 유지합니다. `deleteExpiredToolResults`는 별도의 신뢰된 유지보수 경로로 만료 Result만 삭제하며 Run·Step·Lease를 지우지 않습니다. 기존 Runtime 세 함수·Executor에 자동 연결하지 않았고, 내부 synthetic 테스트로만 통합을 검증합니다. Reclaim·Release·Token 교체·Worker·heartbeat·Checkpoint·Replay·Retry·Recovery·Exactly-Once는 구현하지 않았습니다.
 
-## Durable Checkpoint & Budget · 보수적 진행 기록 (P3-C 구현·검토 중)
+## Durable Checkpoint & Budget · 보수적 진행 기록 (P3-C 완료)
 
-Issue #35의 로컬 구현이며 아직 staging·commit·PR·병합하지 않았습니다. `createRunExecutionProgressRepository(db)`는 전용 connection을 제공하는 내부 DB 의존성을 받습니다. 기존 Runtime의 Decision/Tool 예산은 여전히 메모리에서 관리하며 새 Ledger를 자동 호출하지 않습니다. `run_steps`는 전체 Model/Tool 호출 로그가 아니므로 기존 Step에서 예산을 역산하거나 backfill하지 않습니다.
+Issue #35는 PR #36으로 병합했고 main에서 검증했습니다. `createRunExecutionProgressRepository(db)`는 전용 connection을 제공하는 내부 DB 의존성을 받습니다. 기존 Runtime의 Decision/Tool 예산은 여전히 메모리에서 관리하며 새 Ledger를 자동 호출하지 않습니다. `run_steps`는 전체 Model/Tool 호출 로그가 아니므로 기존 Step에서 예산을 역산하거나 backfill하지 않습니다.
 
 **A checkpoint watermark is evidence of observed committed metadata, not permission to replay.**
 
@@ -648,9 +648,17 @@ Migration #9의 `run_execution_progress`는 run_id PK/FK, schema_version=1, chec
 
 Snapshot의 `diagnostic` 우선순위는 **inconsistent → steps_ahead → aligned**입니다. Step 순번에 구멍이 있거나 watermark가 관찰 최대값보다 크거나 확인 대상 Step이 없거나 비종료 종류가 아니면 inconsistent, 그 외 최대 Step이 watermark(null은 0)보다 크면 steps_ahead, 같으면 aligned입니다. Lease 관찰은 missing → run_not_running → invalid_clock → expired → active 순서로 판단합니다. Token·Owner·Task·원본 Step·Tool Output·실행 허가 필드는 반환하지 않습니다. **aligned/active는 resumable 또는 후속 쓰기 권한이 아닙니다.** Terminal Run도 관찰할 수 있지만 확인 API는 terminal Step을 허용하지 않습니다.
 
-Step COMMIT과 watermark COMMIT은 별개입니다. Step #2 저장 후 프로세스가 종료되면 watermark #1과 `steps_ahead`가 남을 수 있으며 조회는 이를 수정하거나 재확인하지 않습니다. Terminal Finalizer와 Progress도 원자적으로 결합하지 않았습니다. 예산 예약은 실제 호출의 시작·성공·완료 증명이 아니고, 실패·응답 유실·crash 후 환불하지 않습니다. Tool 결과가 불명확할 때 재호출하면 외부 부작용이 중복될 수 있습니다. No Resume / No Retry / No Replay / No Recovery이며 Exactly-Once를 구현하지 않았습니다. 직접 SQL·구버전 writer·외부 서비스의 부작용까지 보호하지 않습니다. HTTP·Runtime·Executor·Worker·heartbeat·실제 Model/Tool 호출 통합은 후속 범위입니다.
+Step COMMIT과 watermark COMMIT은 별개입니다. Step #2 저장 후 프로세스가 종료되면 watermark #1과 `steps_ahead`가 남을 수 있으며 조회는 이를 수정하거나 재확인하지 않습니다. Terminal Finalizer와 Progress도 원자적으로 결합하지 않았습니다. 예산 예약은 실제 호출의 시작·성공·완료 증명이 아니고, 실패·응답 유실·crash 후 환불하지 않습니다. Tool 결과가 불명확할 때 재호출하면 외부 부작용이 중복될 수 있습니다. No Resume / No Retry / No Replay / No Recovery이며 Exactly-Once를 구현하지 않았습니다. 직접 SQL·구버전 writer·외부 서비스의 부작용까지 보호하지 않습니다. 기존 Runtime 세 경로는 메모리 예산을 사용합니다. 아래 P3-D 진입점에서 Decision 예산을 영속적으로 예약합니다.
 
 신규 검증은 `apps/api/test/execution-progress.test.ts`와 `apps/api/test/db/execution-progress.test.ts`에 있으며 기존 `npm test` / `npm run test:db`에 포함됩니다. 격리 `axiom_test` schema에서 synthetic P3-A Claim → 예약 → P3-B Step COMMIT → 확인 흐름, 독립 backend의 CAS·잠금·renewal 경합, 시간 경계, 실패 원자성, migration 보호를 검사합니다. 정확한 microsecond 경계는 실제 SQL의 단일 clock 표현식만 치환하며 실제 DB 시계 기반 lock-wait와 구분합니다. COMMIT 후 응답 유실은 모사이며 실제 네트워크 단절 실험이 아닙니다. 기존 HTTP 서버 재시작 회귀도 계속 실행합니다. 추가 live smoke·외부 Tool/LLM 요청은 하지 않습니다.
+
+## Trusted Lease-Bound Decision Orchestration · P3-D 로컬 검토 중
+
+신뢰된 Host가 내부 함수 `runLeaseBoundedDecisions(runId, dependencies, options)`를 명시적으로 호출합니다. 호출자는 Owner UUID, Lease 기간(1~300초), Decision 상한(1~5회)을 지정합니다. 새 Claim이 성공해야 Progress를 초기화하며 Tool 예산은 0입니다. 이미 시작된 Run을 다시 호출하면 `not_started`로 끝납니다.
+
+각 Decision은 해당 슬롯의 예산 예약 COMMIT을 확인한 뒤 호출합니다. 다음 슬롯을 사용하려면 먼저 `continued` Step과 그 순번의 watermark가 각각 COMMIT돼야 합니다. 마지막 `continue`는 `decision_limit_exceeded`, Tool 요청은 `unsupported_tool_request`로 종료합니다. Lease-aware Finalizer는 종료 상태와 Step을 함께 저장합니다. Terminal Step은 watermark에 포함하지 않으므로 정상 종료 후에도 snapshot이 `steps_ahead`일 수 있습니다.
+
+Claim과 초기화는 별도 트랜잭션입니다. 초기화 실패나 콜백 도중 Lease 만료로 Run이 running에 남을 수 있습니다. 충돌은 단계별 고정 결과로 반환하고 DB 오류·불확실한 COMMIT은 호출자에게 reject합니다. 예산 환불, 자동 갱신·재개·재시도·재생·복구는 수행하지 않습니다. 예약은 실제 호출 완료를 보장하지 않으며 Exactly-Once도 제공하지 않습니다. 이 경로에는 Worker, HTTP 트리거, 실제 모델 클라이언트, Tool Executor가 없습니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -692,14 +700,14 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A/B는 병합·검증 완료됐고 P3-C는 Durable Checkpoint & Budget 구현·검토 단계입니다. P3-D 이후 항목은 아직 구현하지 않았습니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A/B/C는 병합·검증 완료됐고 P3-D는 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
-| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A/B 완료; P3-C Progress Ledger 구현·검토 중; D 이후 미구현 |
+| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A/B/C 완료, P3-D 로컬 구현·검토 중 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
