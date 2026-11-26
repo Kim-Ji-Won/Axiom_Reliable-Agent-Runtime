@@ -1,3 +1,5 @@
+import { runOneShotWorker } from '../src/runtime/run-one-shot-worker.js';
+import { createToolAuthorizationPolicy, createToolAuthorizationPermit, type ToolAuthorizationEffect } from '../src/tools/tool-authorization-policy.js';
 import { z } from 'zod';
 import { createInMemoryToolExecutor } from '../src/tools/in-memory-tool-executor.js';
 import { createToolRegistry } from '../src/tools/tool-registry.js';
@@ -436,3 +438,96 @@ it.each([{ task: 'another task' }, { createdAt: new Date(date.getTime() + 1) }])
     expect(deps.tryConfirmCommittedStep).toHaveBeenCalledTimes(1);
     expect(deps.tryFinalizeWithStepWithLease).not.toHaveBeenCalled();
   });
+
+function policyExecutor(effect: ToolAuthorizationEffect) {
+  const policy = createToolAuthorizationPolicy([{ runId: id, toolName: request.toolName, arguments: request.arguments, effect }]);
+  const gate = vi.fn(createToolAuthorizationPermit(policy));
+  const handler = vi.fn(() => ({ ok: true }));
+  const real = createInMemoryToolExecutor({
+    registry: createToolRegistry([{ name: 'echo', inputSchema: z.strictObject({ message: z.string() }) }]),
+    handlers: [{ name: 'echo', handle: handler }], permitExecution: gate,
+  });
+  return { executor: { execute: vi.fn(real.execute) }, gate, handler };
+}
+
+it.each(['allow', 'deny', 'approval_required'] as const)('evaluates Host %s only after the Tool reservation ACK', async effect => {
+  const deps = fixture();
+  const { executor, gate, handler } = policyExecutor(effect);
+  const order: string[] = [];
+  deps.decide.mockReturnValueOnce(request).mockImplementation(() => {
+    order.push('next decision');
+    return { kind: 'final', content: 'done' };
+  });
+  let acknowledge!: () => void;
+  const barrier = new Promise<void>(resolve => { acknowledge = resolve; });
+  const pending = execute(id, {
+    ...deps, executor,
+    async tryReserveToolAttempt(...args) {
+      const reserved = await deps.tryReserveToolAttempt(...args);
+      await barrier;
+      return reserved;
+    },
+    async appendToolSucceededStepWithLease(...args) {
+      const step = await deps.appendToolSucceededStepWithLease(...args);
+      order.push('step ACK');
+      return step;
+    },
+    async tryConfirmCommittedStep(...args) {
+      const progress = await deps.tryConfirmCommittedStep(...args);
+      order.push('watermark ACK');
+      return progress;
+    },
+  }, options);
+  try {
+    await vi.waitFor(() => expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(1));
+    for (const spy of [executor.execute, gate, handler]) expect(spy).not.toHaveBeenCalled();
+  } finally { acknowledge(); }
+  const allowed = effect === 'allow';
+  expect(await pending).toEqual(allowed ? { kind: 'completed', content: 'done' } : { kind: 'tool_failed', code: 'execution_unavailable' });
+  expect(order).toEqual(allowed ? ['step ACK', 'watermark ACK', 'next decision'] : []);
+  expect(deps.tryClaimRunLease).toHaveBeenCalledTimes(1);
+  expect(deps.tryReserveDecision).toHaveBeenCalledTimes(allowed ? 2 : 1);
+  expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(1);
+  expect(deps.tryFinalizeWithStepWithLease).toHaveBeenCalledTimes(1);
+  expect(executor.execute).toHaveBeenCalledTimes(1);
+  expect(gate).toHaveBeenCalledTimes(1);
+  expect(handler).toHaveBeenCalledTimes(allowed ? 1 : 0);
+});
+
+it.each([[1, 1, 'decision_limit_exceeded'], [2, 0, 'tool_execution_limit_exceeded']] as const)(
+  'keeps an exact allow behind decision cap %i and tool cap %i', async (maxDecisions, maxToolAttempts, kind) => {
+    const deps = fixture(maxDecisions, maxToolAttempts);
+    const { executor, gate, handler } = policyExecutor('allow');
+    deps.decide.mockReturnValue(request);
+    expect(await execute(id, { ...deps, executor }, { ...options, maxDecisions, maxToolAttempts })).toEqual({ kind });
+    for (const spy of [deps.tryReserveToolAttempt, executor.execute, gate, handler]) expect(spy).not.toHaveBeenCalled();
+  });
+
+it.each(['conflict', 'DB rejection'] as const)('preserves finalizer %s after a Host denial', async failure => {
+  const deps = fixture();
+  const { executor, handler } = policyExecutor('deny');
+  deps.decide.mockReturnValue(request);
+  const error = new Error('Test finalizer failure');
+  if (failure === 'conflict') deps.tryFinalizeWithStepWithLease.mockResolvedValueOnce(null);
+  else deps.tryFinalizeWithStepWithLease.mockRejectedValueOnce(error);
+  const result = execute(id, { ...deps, executor }, options);
+  if (failure === 'conflict') await expect(result).resolves.toEqual({ kind: 'finalize_conflict' });
+  else await expect(result).rejects.toBe(error);
+  expect(deps.tryFinalizeWithStepWithLease).toHaveBeenCalledTimes(1);
+  expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(1);
+  expect(handler).not.toHaveBeenCalled();
+});
+
+it('keeps a matching Host allow out of the decision-only Worker path', async () => {
+  const { executor, gate, handler } = policyExecutor('allow');
+  const { tryReserveToolAttempt, appendToolSucceededStepWithLease, executor: unusedExecutor, ...common } = fixture(2, 0);
+  const deps = { ...common, decide: () => request };
+  const config = { ...options, mode: 'decision_only', maxToolAttempts: 0 } as const;
+  // An executor on this mode is an invalid dependency, even when its policy would allow.
+  await expect(runOneShotWorker(id, { ...deps, executor } as never, config)).rejects.toThrow('Invalid one-shot worker input');
+  expect(common.tryClaimRunLease).not.toHaveBeenCalled();
+  expect(await runOneShotWorker(id, deps, config)).toEqual({ kind: 'unsupported_tool_request' });
+  for (const spy of [tryReserveToolAttempt, appendToolSucceededStepWithLease, unusedExecutor.execute, executor.execute, gate, handler]) {
+    expect(spy).not.toHaveBeenCalled();
+  }
+});

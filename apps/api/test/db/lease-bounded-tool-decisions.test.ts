@@ -1,3 +1,4 @@
+import { createToolAuthorizationPolicy, createToolAuthorizationPermit } from '../../src/tools/tool-authorization-policy.js';
 import { z } from 'zod';
 import { createToolRegistry } from '../../src/tools/tool-registry.js';
 import { createInMemoryToolExecutor } from '../../src/tools/in-memory-tool-executor.js';
@@ -344,4 +345,34 @@ it.each([1, 2, 3, 4, 5])('confirms every continued slot up to the decision limit
     expect(f.handler).not.toHaveBeenCalled();
     expect(await f.progress.getProgressSnapshot(id)).toMatchObject({ decisionsReserved: max, toolAttemptsReserved: 0,
       checkpointVersion: 2 * max - 1, lastConfirmedStepNo: max === 1 ? null : max - 1, maxStepNo: max });
+  }));
+
+it.each(['allow', 'deny', 'approval_required'] as const)('persists the reservation across Host %s', async effect =>
+  withSchema(async (f, id) => {
+    const policy = createToolAuthorizationPolicy([{ runId: id, toolName: request.toolName, arguments: request.arguments, effect }]);
+    const permit = vi.fn(createToolAuthorizationPermit(policy));
+    const executor = createInMemoryToolExecutor({
+      registry: f.registry, handlers: [{ name: 'echo', handle: f.handler }], permitExecution: permit,
+    });
+    // The observer reads the committed reservation before this call enters the real executor.
+    const observed: unknown[] = [];
+    f.deps.executor.execute.mockImplementation(async (...args) => {
+      observed.push(await f.progress.getProgressSnapshot(id));
+      return executor.execute(...args);
+    });
+    const allowed = effect === 'allow';
+    expect(await execute(id, f.deps, options)).toEqual(allowed ?
+      { kind: 'completed', content: 'done' } : { kind: 'tool_failed', code: 'execution_unavailable' });
+    expect(observed).toMatchObject([{ runStatus: 'running', decisionsReserved: 1, toolAttemptsReserved: 1, lastConfirmedStepNo: null }]);
+    expect(await f.progress.getProgressSnapshot(id)).toMatchObject({
+      runStatus: allowed ? 'completed' : 'failed', decisionsReserved: allowed ? 2 : 1,
+      toolAttemptsReserved: 1, lastConfirmedStepNo: allowed ? 1 : null,
+    });
+    expect(await steps(f.client, id)).toEqual(allowed ?
+      [{ step_no: 1, result_kind: 'tool_succeeded' }, { step_no: 2, result_kind: 'completed' }] :
+      [{ step_no: 1, result_kind: 'tool_failed' }]);
+    expect(permit).toHaveBeenCalledTimes(1);
+    expect(f.deps.executor.execute).toHaveBeenCalledTimes(1);
+    expect(f.deps.decide).toHaveBeenCalledTimes(allowed ? 2 : 1);
+    expect(f.handler).toHaveBeenCalledTimes(allowed ? 1 : 0);
   }));
