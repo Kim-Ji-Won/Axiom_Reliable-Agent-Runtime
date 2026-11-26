@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P3-E — Durable Tool Attempt Protocol 로컬 구현·검토 중. P3-A/B/C/D 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P3-F — One-Shot Worker와 Recovery Inspector 로컬 구현·검토 중. P3-A/B/C/D/E 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -660,13 +660,42 @@ Step COMMIT과 watermark COMMIT은 별개입니다. Step #2 저장 후 프로세
 
 Claim과 초기화는 별도 트랜잭션입니다. 초기화 실패나 콜백 도중 Lease 만료로 Run이 running에 남을 수 있습니다. 충돌은 단계별 고정 결과로 반환하고 DB 오류·불확실한 COMMIT은 호출자에게 reject합니다. 예산 환불, 자동 갱신·재개·재시도·재생·복구는 수행하지 않습니다. 예약은 실제 호출 완료를 보장하지 않으며 Exactly-Once도 제공하지 않습니다. 이 경로에는 Worker, HTTP 트리거, 실제 모델 클라이언트, Tool Executor가 없습니다.
 
-## Durable Tool Attempt Protocol · P3-E 로컬 검토 중
+## Durable Tool Attempt Protocol · P3-E 완료
 
 신뢰된 Host가 내부 함수 `runLeaseBoundedToolDecisions(runId, dependencies, options)`를 선택해 호출합니다. 새 Lease를 획득한 Run에 Decision 1~5회, Tool Attempt 0~1회의 예산을 설정합니다. 마지막 Decision 슬롯에서는 Tool을 예약하지 않습니다. 그 외 슬롯에서 Tool 요청을 받으면 PostgreSQL의 예약 COMMIT 응답과 카운터를 확인한 뒤 Executor를 한 번 호출합니다. 순수 in-memory Handler는 호스트가 등록하고 동기 permit이 정확히 `true`일 때만 실행됩니다.
 
 Tool 성공 시 `tool_succeeded` Step 저장과 해당 순번의 watermark 확인이 차례로 COMMIT돼야 다음 Decision을 예약합니다. 검증된 출력은 다음 Decision 한 번에만 메모리로 전달합니다. 이 경로는 Tool 인자·출력·해시를 저장하지 않습니다. Terminal Step은 watermark에 포함하지 않습니다.
 
-예약 뒤 Lease가 만료되거나 응답이 유실되면 예산이 소비된 채 Run이 남을 수 있습니다. 실행 중 DB 트랜잭션을 잡아 두지 않으며 환불·자동 재시도·재생·복구도 수행하지 않습니다. 예약 기록만으로 외부 효과를 판별할 수 없습니다. 외부 fencing, Exactly-Once, Worker와 사용자 승인은 후속 범위입니다.
+예약 뒤 Lease가 만료되거나 응답이 유실되면 예산이 소비된 채 Run이 남을 수 있습니다. 실행 중 DB 트랜잭션을 잡아 두지 않으며 환불·자동 재시도·재생·복구도 수행하지 않습니다. 예약 기록만으로 외부 효과를 판별할 수 없습니다. 외부 fencing, Exactly-Once, 상시 Worker 프로세스와 사용자 승인은 후속 범위입니다.
+
+## One-Shot Worker & Recovery Inspector · P3-F 로컬 검토 중
+
+신뢰된 Host가 한 Run에 대해 `runOneShotWorker(runId, dependencies, options)`를 명시적으로 호출합니다. 옵션은 정확히 `mode`, `ownerId`(UUID), `leaseSeconds`(1~300), `maxDecisions`(1~5), `maxToolAttempts` 다섯 개입니다. 실행 전 모드별 의존성을 검사합니다.
+
+| 모드 | Tool 예산 | 위임 |
+|---|---|---|
+| `decision_only` | 0 필수 | P3-D에 owner·Lease 기간·Decision 예산만 전달 |
+| `tool_enabled` | 0 또는 1 | P3-E에 Tool 예산까지 전달. Handler는 기존 동기 permit 규칙 적용 |
+
+Worker는 신뢰된 Host가 전달한 일반 함수, async 함수, 화살표 함수, 일반·async 메서드를 지원합니다. 첫 위임 전에 모든 콜백과 `executor.execute`의 형태를 검사합니다. 직접 전달된 클래스 생성자, Proxy, generator·async generator, 원본 소스를 확인할 수 없는 bound/native 함수는 입력 오류로 거부합니다. 일반 함수에 `bind()`를 적용한 경우도 여기에 포함됩니다.
+
+이 검사는 변조되지 않은 JavaScript 내장 메서드를 전제로 합니다. Worker는 후보의 `toString`을 읽거나 후보를 실행·생성하지 않고 내장 `Function.prototype.toString`으로 소스 형태를 확인합니다. 함수 본문의 동작과 반환값은 실행 시점에 결정되며, 예외와 반환값 검증은 기존 Orchestrator 계약을 따릅니다.
+
+두 경로 모두 Fresh Claim부터 기존 Orchestrator가 처리합니다. Worker는 한 번 위임하고 그 결과 또는 내부 rejection을 전달합니다. 응답이 유실돼도 다른 모드 호출, 자동 재시도·재개·재생·환불은 없습니다.
+
+`createRunRecoveryInspectionRepository(pool).inspectRunRecovery(runId)`는 매개변수화한 SELECT 한 문장으로 Run·Lease·Progress·Step을 관찰합니다. PostgreSQL 시각은 한 번 평가합니다. Run이 없으면 `missing_run`을, 있으면 category와 status·lease·progress·steps, 두 진단 필드를 반환합니다. Progress 부재는 `null`입니다. Lease의 active/expired는 관찰 시각의 유효 기간만 나타냅니다.
+
+| 분류 우선순위 | 관찰 의미 |
+|---|---|
+| `legacy_or_inconsistent_manual_review` | 시간·카운터 관계, Step 연속성, 종료 상태 등이 맞지 않거나 running에 Lease가 없어 수동 검토가 필요 |
+| `terminal_observed` / `queued_observed` | 종료 상태와 마지막 종료 Step이 호환되거나, 아무 실행 기록이 없는 queued Run |
+| `claimed_without_progress` | Lease 획득 뒤 초기화 기록이 없는 running Run |
+| `ambiguous_attempt_manual_review` / `unconfirmed_step_manual_review` | Tool 예약에 대응하는 성공 Step이 없거나 비종료 Step이 watermark보다 앞섬 |
+| `expired_lease_manual_review` / `active_lease_unverified` | 위 진단이 없는 running Run의 Lease 시간 관찰. 프로세스 생존 여부는 미확인 |
+
+`ambiguousToolAttempt`와 `unconfirmedNonterminalStep`은 대표 분류와 함께 읽습니다. 예를 들어 Handler 응답 유실 후 failed Run과 종료 Step을 확인해도 Tool 효과는 불확실할 수 있습니다. 정상적인 마지막 종료 Step은 watermark 확인 대상에서 제외됩니다. DB 조회 실패는 `Recovery inspection query failed`, 응답 계약 위반은 `Invalid recovery observation`으로 reject합니다.
+
+관찰은 즉시 오래될 수 있으며 실행 권한을 부여하지 않습니다. Inspector는 task·owner·token·Tool 원문을 읽거나 저장하지 않습니다. 테스트는 격리 DB에서 읽기 전용 트랜잭션, 독립 연결의 snapshot·Claim 경합, COMMIT 직후 응답 유실을 검증합니다. 운영 Worker 프로세스, polling, 자동 Lease 인수·복구 및 외부 부작용의 Exactly-Once는 후속 범위입니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -708,14 +737,14 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A/B/C/D는 병합·검증 완료됐고 P3-E는 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A/B/C/D/E는 병합·검증 완료됐고 P3-F는 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
 | P0 — Foundation | 백엔드 기반, PostgreSQL 저장, Run API 계약, 테스트 환경 | A1~A4 완료 |
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
-| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A/B/C/D 완료, P3-E 로컬 구현·검토 중 |
+| P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A/B/C/D/E 완료, P3-F 로컬 구현·검토 중 |
 | P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | 예정 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
