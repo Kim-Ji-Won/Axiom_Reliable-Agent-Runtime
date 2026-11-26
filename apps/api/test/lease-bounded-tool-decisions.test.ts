@@ -1,3 +1,5 @@
+import { createToolApprovalGrant, createToolApprovalPermit, inspectToolApprovalGrant, revokeToolApprovalGrant } from '../src/tools/tool-approval-grant.js';
+import * as approvalClock from '../src/tools/tool-approval-clock.js';
 import { runOneShotWorker } from '../src/runtime/run-one-shot-worker.js';
 import { createToolAuthorizationPolicy, createToolAuthorizationPermit, type ToolAuthorizationEffect } from '../src/tools/tool-authorization-policy.js';
 import { z } from 'zod';
@@ -531,3 +533,119 @@ it('keeps a matching Host allow out of the decision-only Worker path', async () 
     expect(spy).not.toHaveBeenCalled();
   }
 });
+
+function approvalFixture(maxDecisions = 2, maxToolAttempts = 1) {
+  const deps = fixture(maxDecisions, maxToolAttempts);
+  const scope = { runId: id, toolName: request.toolName, arguments: request.arguments };
+  const plan = { ...scope, kind: 'pending_authorization' } as const;
+  const policy = createToolAuthorizationPolicy([{ ...scope, effect: 'approval_required' }]);
+  const grant = createToolApprovalGrant(policy, plan, 300);
+  const gate = vi.fn(createToolApprovalPermit(policy, grant));
+  const handler = vi.fn(() => {
+    expect(inspectToolApprovalGrant(grant).kind).toBe('consumed');
+    return { ok: true };
+  });
+  const real = createInMemoryToolExecutor({
+    registry: createToolRegistry([{ name: 'echo', inputSchema: z.strictObject({ message: z.string() }) }]),
+    handlers: [{ name: 'echo', handle: handler }], permitExecution: gate,
+  });
+  deps.executor.execute.mockImplementation(real.execute);
+  deps.decide.mockReturnValueOnce(request).mockReturnValue({ kind: 'final', content: 'done' });
+  return { deps, grant, gate, handler, plan };
+}
+
+it.each(['active', 'revoked', 'expired'] as const)('observes %s grant only after reservation ACK', async state => {
+  const time = vi.spyOn(approvalClock, 'readApprovalTime').mockReturnValue(0n);
+  try {
+    const { deps, grant, gate, handler } = approvalFixture();
+    const reserve = deps.tryReserveToolAttempt.getMockImplementation()!;
+    let acknowledge!: () => void;
+    const barrier = new Promise<void>(resolve => { acknowledge = resolve; });
+    deps.tryReserveToolAttempt.mockImplementation(async (...args) => {
+      const progress = await reserve(...args);
+      await barrier;
+      return progress;
+    });
+    const order: string[] = [];
+    const job = execute(id, { ...deps,
+      async appendToolSucceededStepWithLease(...args) {
+        const step = await deps.appendToolSucceededStepWithLease(...args);
+        order.push('step ACK');
+        return step;
+      },
+      async tryConfirmCommittedStep(...args) {
+        const progress = await deps.tryConfirmCommittedStep(...args);
+        order.push('watermark ACK');
+        return progress;
+      },
+      decide(...args) {
+        if (deps.decide.mock.calls.length === 1) order.push('next decision');
+        return deps.decide(...args);
+      },
+    }, options);
+    try {
+      await vi.waitFor(() => expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(1));
+      expect(inspectToolApprovalGrant(grant).kind).toBe('active');
+      for (const spy of [deps.executor.execute, gate, handler]) expect(spy).not.toHaveBeenCalled();
+      if (state === 'expired') time.mockReturnValue(300_000_000_000n);
+      if (state === 'revoked') expect(revokeToolApprovalGrant(grant)).toBe(true);
+    } finally { acknowledge(); await job; }
+    const admitted = state === 'active';
+    expect(await job).toEqual(admitted ? { kind: 'completed', content: 'done' } : { kind: 'tool_failed', code: 'execution_unavailable' });
+    expect(order).toEqual(admitted ? ['step ACK', 'watermark ACK', 'next decision'] : []);
+    expect(inspectToolApprovalGrant(grant).kind).toBe(admitted ? 'consumed' : state);
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledTimes(admitted ? 1 : 0);
+    expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(1);
+    expect(deps.tryFinalizeWithStepWithLease.mock.calls.map(call => call[1])).toEqual([admitted ? 'completed' : 'tool_failed']);
+  } finally { time.mockRestore(); }
+});
+
+it.each(['decision cap', 'tool cap', 'decision only', 'claim', 'lost reservation ACK'] as const)(
+  'preserves a usable grant before admission at %s', async stage => {
+    const maxDecisions = stage === 'decision cap' ? 1 : 2;
+    const maxToolAttempts = stage === 'tool cap' || stage === 'decision only' ? 0 : 1;
+    const { deps, gate, handler, grant, plan } = approvalFixture(maxDecisions, maxToolAttempts);
+    if (stage === 'decision only') {
+      const { tryReserveToolAttempt, executor, appendToolSucceededStepWithLease, ...common } = deps;
+      expect(await runOneShotWorker(id, { ...common, decide: () => request }, { ...options, mode: 'decision_only', maxToolAttempts: 0 }))
+        .toEqual({ kind: 'unsupported_tool_request' });
+    } else {
+      if (stage === 'claim') deps.tryClaimRunLease.mockResolvedValue(null);
+      const lost = Error('Lost reservation ACK');
+      if (stage === 'lost reservation ACK') {
+        const reserve = deps.tryReserveToolAttempt.getMockImplementation()!;
+        deps.tryReserveToolAttempt.mockImplementation(async (...args) => { await reserve(...args); throw lost; });
+      }
+      const job = execute(id, deps, { ...options, maxDecisions, maxToolAttempts });
+      if (stage === 'lost reservation ACK') await expect(job).rejects.toBe(lost);
+      else expect(await job).toEqual({ kind: stage === 'claim' ? 'not_started' :
+        stage === 'tool cap' ? 'tool_execution_limit_exceeded' : 'decision_limit_exceeded' });
+    }
+    expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(stage === 'lost reservation ACK' ? 1 : 0);
+    for (const spy of [deps.executor.execute, gate, handler]) expect(spy).not.toHaveBeenCalled();
+    expect(inspectToolApprovalGrant(grant).kind).toBe('active');
+    expect(gate(plan)).toBe(true);
+  });
+
+for (const [stage, kind] of [
+  ['appendToolSucceededStepWithLease', 'step_persistence_conflict'],
+  ['tryConfirmCommittedStep', 'checkpoint_conflict'],
+  ['tryFinalizeWithStepWithLease', 'finalize_conflict'],
+] as const) {
+  it.each(['conflict', 'lost ACK'])('keeps the grant consumed on ' + stage + ' %s', async failure => {
+    const { deps, grant, gate, handler, plan } = approvalFixture();
+    const lost = Error('Commit response lost');
+    if (failure === 'conflict') deps[stage].mockResolvedValueOnce(null);
+    else deps[stage].mockRejectedValueOnce(lost);
+    const job = execute(id, deps, options);
+    if (failure === 'conflict') expect(await job).toEqual({ kind });
+    else await expect(job).rejects.toBe(lost);
+    expect(deps[stage]).toHaveBeenCalledTimes(1);
+    expect(deps.tryReserveToolAttempt).toHaveBeenCalledTimes(1);
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(inspectToolApprovalGrant(grant).kind).toBe('consumed');
+    expect(gate(plan)).toBe(false);
+  });
+}
