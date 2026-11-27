@@ -1,3 +1,5 @@
+import { createToolApprovalGrant, createToolApprovalPermit, inspectToolApprovalGrant, revokeToolApprovalGrant } from '../../src/tools/tool-approval-grant.js';
+import { runOneShotWorker } from '../../src/runtime/run-one-shot-worker.js';
 import { createToolAuthorizationPolicy, createToolAuthorizationPermit } from '../../src/tools/tool-authorization-policy.js';
 import { z } from 'zod';
 import { createToolRegistry } from '../../src/tools/tool-registry.js';
@@ -374,5 +376,34 @@ it.each(['allow', 'deny', 'approval_required'] as const)('persists the reservati
     expect(permit).toHaveBeenCalledTimes(1);
     expect(f.deps.executor.execute).toHaveBeenCalledTimes(1);
     expect(f.deps.decide).toHaveBeenCalledTimes(allowed ? 2 : 1);
+    expect(f.handler).toHaveBeenCalledTimes(allowed ? 1 : 0);
+  }));
+
+it.each(['active', 'revoked'] as const)('binds %s Host grant to the fresh Run across two Worker calls', async state =>
+  withSchema(async (f, id) => {
+    const scope = { runId: id, toolName: request.toolName, arguments: request.arguments };
+    const policy = createToolAuthorizationPolicy([{ ...scope, effect: 'approval_required' }]);
+    const grant = createToolApprovalGrant(policy, { ...scope, kind: 'pending_authorization' }, 300);
+    if (state === 'revoked') expect(revokeToolApprovalGrant(grant)).toBe(true);
+    const gate = vi.fn(createToolApprovalPermit(policy, grant));
+    f.deps.executor.execute.mockImplementation(createInMemoryToolExecutor({
+      registry: f.registry, handlers: [{ name: 'echo', handle: f.handler }], permitExecution: gate,
+    }).execute);
+    const config = { ...options, mode: 'tool_enabled', maxToolAttempts: 1 } as const;
+    const allowed = state === 'active';
+    expect(await runOneShotWorker(id, f.deps, config)).toEqual(allowed ?
+      { kind: 'completed', content: 'done' } : { kind: 'tool_failed', code: 'execution_unavailable' });
+    expect(await runOneShotWorker(id, f.deps, config)).toEqual({ kind: 'not_started' });
+    expect(inspectToolApprovalGrant(grant).kind).toBe(allowed ? 'consumed' : 'revoked');
+    expect(await f.progress.getProgressSnapshot(id)).toMatchObject({
+      runStatus: allowed ? 'completed' : 'failed', toolAttemptsReserved: 1, decisionsReserved: allowed ? 2 : 1,
+      lastConfirmedStepNo: allowed ? 1 : null,
+    });
+    expect(await steps(f.client, id)).toEqual(allowed ?
+      [{ step_no: 1, result_kind: 'tool_succeeded' }, { step_no: 2, result_kind: 'completed' }] :
+      [{ step_no: 1, result_kind: 'tool_failed' }]);
+    expect(f.deps.decide).toHaveBeenCalledTimes(allowed ? 2 : 1);
+    expect(f.deps.executor.execute).toHaveBeenCalledTimes(1);
+    expect(gate).toHaveBeenCalledTimes(1);
     expect(f.handler).toHaveBeenCalledTimes(allowed ? 1 : 0);
   }));

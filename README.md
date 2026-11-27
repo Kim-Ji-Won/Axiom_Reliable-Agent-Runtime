@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P4-A — Trusted Host Authorization Policy 로컬 구현·검토 중. P3-A~F 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P4-B — Trusted Host Approval Grant 로컬 구현·검토 중. P4-A 병합·검증 완료. P3-A~F 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -697,13 +697,23 @@ Worker는 신뢰된 Host가 전달한 일반 함수, async 함수, 화살표 함
 
 관찰은 즉시 오래될 수 있으며 실행 권한을 부여하지 않습니다. Inspector는 task·owner·token·Tool 원문을 읽거나 저장하지 않습니다. 테스트는 격리 DB에서 읽기 전용 트랜잭션, 독립 연결의 snapshot·Claim 경합, COMMIT 직후 응답 유실을 검증합니다. 운영 Worker 프로세스, polling, 자동 Lease 인수·복구 및 외부 부작용의 Exactly-Once는 후속 범위입니다.
 
-## Trusted Host Authorization Policy · P4-A 로컬 검토 중
+## Trusted Host Authorization Policy · P4-A 완료
 
 Host는 `createToolAuthorizationPolicy(rules?)`로 최대 32개의 정적 규칙을 구성하고 기존 Executor에 `permitExecution: createToolAuthorizationPermit(policy)`를 전달합니다. 기본 정책은 모든 요청을 거부합니다. 각 규칙은 Run UUID(대소문자 무관), Tool 이름, 중첩 인자의 정확한 값에 적용됩니다. 객체 키 순서는 무관하고 배열 순서와 숫자의 부호 있는 0은 구분합니다. 정책은 인자를 독립 복사하며 같은 범위의 중복 규칙은 거부합니다.
 
 `evaluateToolAuthorization(policy, plan)`은 현재 요청을 평가합니다. `allow`만 동기 permit을 통과하고 `deny`와 `approval_required`에서는 Handler를 호출하지 않습니다. `approval_required`는 Host가 읽는 진단 결과입니다. P3-E에서는 Tool 예약의 COMMIT 응답을 받은 뒤 Executor가 Preflight와 정책 검사를 수행하므로 거부해도 예약은 유지됩니다. 거부 시 기존 `execution_unavailable` 경로를 따르며 Finalizer가 성공하면 Run은 failed로 종료됩니다.
 
-권한의 출처는 신뢰된 Host 구성입니다. 같은 요청의 독립 실행은 매번 허용될 수 있습니다. 사용자 동의 확인, 승인 대기·재개, 일회성 허가, 만료·철회는 후속 P4 범위입니다. 이 정책은 Lease를 검사하거나 외부 효과의 Exactly-Once를 보장하지 않습니다.
+권한의 출처는 신뢰된 Host 구성입니다. 같은 요청의 독립 실행은 매번 허용될 수 있습니다. 정적 allow는 호출마다 평가합니다. 이 정책은 Lease를 검사하거나 외부 효과의 Exactly-Once를 보장하지 않습니다.
+
+## Trusted Host Approval Grant · P4-B 로컬 검토 중
+
+신뢰된 Host가 Run UUID와 요청을 알고 있을 때, 현재 정책에서 `approval_required`인 Plan에 `createToolApprovalGrant(policy, plan, ttlSeconds)`로 일회성 허가를 발급합니다. Executor에 `permitExecution: createToolApprovalPermit(policy, grant)`를 명시적으로 연결합니다. 같은 정책 객체, Run, Tool 이름, 인자 snapshot이 일치해야 합니다. 이 경로에서 정적 allow로 대체하거나 다른 Grant를 찾지 않습니다.
+
+TTL은 정수 1~300초이며 프로세스의 monotonic clock으로 측정합니다. `inspectToolApprovalGrant(grant)`로 상태를 확인하고 `revokeToolApprovalGrant(grant)`로 활성 허가를 철회합니다. 만료는 deadline부터 적용되며, 시계를 읽지 못하거나 시각이 역행하면 무효화합니다. UTC 기준 만료 시각이나 절전 시간을 포함한 경과 시간은 보장하지 않습니다.
+
+한 JS isolate에서 같은 Grant는 Handler 호출 전에 동기적으로 한 번만 소비됩니다. 같은 범위에 별도로 발급한 Grant는 각각 사용할 수 있습니다. 예약 ACK나 Preflight를 통과하지 못하면 소비하지 않습니다. 소비 후에는 Handler 미등록·실패, 저장 충돌, COMMIT 응답 유실에도 환불·자동 재실행이 없습니다. 소비 상태만으로 Handler의 실행이나 외부 효과를 증명할 수 없습니다. 이미 시작한 Handler의 취소도 지원하지 않습니다.
+
+Grant는 메모리에만 존재합니다. Terminal 상태에서는 private entry에서 정책·인자·시각을 제거하지만 adapter가 캡처한 참조는 남을 수 있으며 메모리 소거와 GC 완료는 보장하지 않습니다. 사용자 인증·동의 증명, DB 저장, 프로세스 간 공유·원자적 소비, 재시작 복원, 승인 대기·재개 및 외부 실행의 Exactly-Once는 지원 범위 밖입니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -745,7 +755,7 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A~F는 병합·검증 완료됐고 P4-A는 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A~F는 병합·검증 완료됐고 P4-A는 병합 완료, P4-B는 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
@@ -753,7 +763,7 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A~F 완료 |
-| P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | P4-A 로컬 구현·검토 중 |
+| P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | P4-A 완료 · P4-B 로컬 검토 중 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
 
