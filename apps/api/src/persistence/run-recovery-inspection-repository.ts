@@ -79,9 +79,10 @@ function decode(raw: unknown, id: string) {
   const nonterminalCount = count - terminals;
   const ambiguousToolAttempt = !!progress && progress.toolAttemptsReserved > toolSuccesses;
   const unconfirmedNonterminalStep = !!progress && nonterminalCount > watermark;
-  const terminal = status === 'completed' || status === 'failed';
-  const compatibleEnd = terminals === 1 && (status === 'completed' ? lastKind === 'completed' :
-    lastKind !== 'completed' && finalizationResultKinds.some(kind => kind === lastKind));
+  const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+  const compatibleEnd = terminals === 1 && (status === 'failed' ?
+    lastKind !== 'completed' && finalizationResultKinds.some(kind => kind === lastKind) :
+    lastKind === status);
   const inconsistent = (maxStepNo ?? 0) !== count || lease === 'invalid_clock' ||
     (terminal ? !compatibleEnd : terminals !== 0) ||
     (status === 'queued' && (lease !== 'absent' || progress !== null || count !== 0)) ||

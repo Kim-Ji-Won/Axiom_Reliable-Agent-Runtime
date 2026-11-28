@@ -312,7 +312,8 @@ describe('real PostgreSQL bounded decisions', () => {
   }));
 
   it('adds only the fifth constraint extension, preserves old data, safely downs and reapplies', async () => withSchema(async ({ schema, client, db }) => {
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(9);
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(10);
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test', 'down', schema); // safe result table
@@ -325,8 +326,9 @@ describe('real PostgreSQL bounded decisions', () => {
     for (const kind of ['completed', 'unsupported_tool_request', 'invalid_decision', 'decision_source_error', 'finalize_conflict'] as const) await client.query("INSERT INTO run_steps(run_id,step_no,result_kind) SELECT $1,COALESCE(MAX(step_no),0)+1,$2 FROM run_steps WHERE run_id=$1", [created.id,kind]);
     const before = await snapshot(client);
     const columns = (await client.query("SELECT table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema=$1 AND table_name IN ('runs','run_steps') ORDER BY table_name,ordinal_position", [schema])).rows;
-    expect(await migrate('test', 'up', schema)).toHaveLength(5);
+    expect(await migrate('test', 'up', schema)).toHaveLength(6);
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     const after = await snapshot(client);
     expect(after.runs).toEqual(before.runs); expect(after.steps).toEqual(before.steps);
     expect(after.history.slice(0, 4)).toEqual(before.history);
@@ -342,11 +344,12 @@ describe('real PostgreSQL bounded decisions', () => {
     for (const kind of ['continued', 'decision_limit_exceeded', 'unknown']) {
       await expect(client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,6,$2)', [created.id, kind])).rejects.toMatchObject({ code: '23514' });
     }
-    expect(await migrate('test', 'up', schema)).toHaveLength(5);
+    expect(await migrate('test', 'up', schema)).toHaveLength(6);
     await expect(client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,6,'unknown')", [created.id])).rejects.toMatchObject({ code: '23514' });
   }));
 
   it.each(['continued', 'decision_limit_exceeded'] as const)('refuses down with %s preserving data, constraints and full migration history', async kind => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test', 'down', schema); // safe result table
@@ -357,11 +360,12 @@ describe('real PostgreSQL bounded decisions', () => {
     const before = await snapshot(client);
     await expect(migrate('test', 'down', schema)).rejects.toThrow('Cannot remove recorded loop Step kinds');
     expect(await snapshot(client)).toEqual(before);
-    expect(await migrate('test', 'up', schema)).toHaveLength(4); // restore migrations six through nine
+    expect(await migrate('test', 'up', schema)).toHaveLength(5); // restore migrations six through ten
     expect(await migrate('test', 'up', schema)).toHaveLength(0);
   }));
 
   it('locks before down checks and refuses a concurrently committed new Step', async () => withSchema(async ({ schema, client, db }) => {
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     await migrate('test', 'down', schema); // safe result table

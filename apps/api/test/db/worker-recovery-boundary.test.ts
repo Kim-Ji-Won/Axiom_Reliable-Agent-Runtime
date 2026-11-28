@@ -1,3 +1,7 @@
+import { createRunCancellationRepository } from '../../src/persistence/run-cancellation-repository.js';
+import { createRunStepRepository } from '../../src/persistence/run-step-repository.js';
+import { createToolApprovalGrant, createToolApprovalPermit, inspectToolApprovalGrant } from '../../src/tools/tool-approval-grant.js';
+import { createToolAuthorizationPolicy } from '../../src/tools/tool-authorization-policy.js';
 import { z } from 'zod';
 import { createToolRegistry } from '../../src/tools/tool-registry.js';
 import { createInMemoryToolExecutor } from '../../src/tools/in-memory-tool-executor.js';
@@ -320,3 +324,214 @@ it.each(['future renewal', 'missing first step', 'wrong terminal'] as const)(
     expect(f.deps.decide).not.toHaveBeenCalled();
     expect(f.handler).not.toHaveBeenCalled();
   }));
+
+type CancellationFixture = ReturnType<typeof repositories>;
+type CancellationDb = Pick<CancellationFixture['db'], 'connect'>;
+
+function latch() {
+  let open!: () => void;
+  const promise = new Promise<void>(resolve => { open = resolve; });
+  return { promise, open };
+}
+
+// Intercept transaction control on a real, exclusively checked-out backend.
+function observeConnection(db: CancellationDb, beforeCommit?: () => Promise<void>, afterCommit?: () => void) {
+  const releases: boolean[] = [];
+  let pid = 0;
+  const observed = { async connect() {
+    const client = await db.connect();
+    try { pid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid; }
+    catch (error) { client.release(true); throw error; }
+    return {
+      query: (async (sql: string, args?: unknown[]) => {
+        if (sql === 'COMMIT') await beforeCommit?.();
+        const result = await client.query(sql, args);
+        if (sql === 'COMMIT') afterCommit?.();
+        return result;
+      }) as PoolClient['query'],
+      release(discard?: boolean | Error) { releases.push(Boolean(discard)); client.release(discard); },
+    };
+  } };
+  return { db: observed, pid: () => pid, releases };
+}
+
+it.each([
+  ['cancel', 'cancel'], ['cancel', 'claim'], ['claim', 'cancel'], ['cancel', 'finish'], ['finish', 'cancel'],
+  ['cancel', 'reserve'], ['reserve', 'cancel'], ['cancel', 'append'], ['cancel', 'downgrade'],
+] as const)('serializes %s before %s on independent PostgreSQL backends', async (first, second) =>
+  withSchema(async (f, id) => {
+    const legacyRunning = first === 'finish' || second === 'finish';
+    if (legacyRunning) expect(await f.runs.tryStartRun(id)).not.toBeNull();
+    const reservation = first === 'reserve' || second === 'reserve';
+    const claimArgs = { ownerId: options.ownerId, leaseSeconds: 30 };
+    const claim = reservation ? await f.leases.tryClaimRunLease(id, claimArgs) : null;
+    const auth = { ownerId: options.ownerId, leaseToken: claim?.leaseToken ?? '' };
+    if (reservation) expect(await f.progress.initializeProgress(id, auth, { maxDecisions: 2, maxToolAttempts: 1 })).not.toBeNull();
+    const schema = (await f.client.query('SELECT current_schema() AS name')).rows[0].name;
+    const gate = latch();
+    let atCommit = false;
+    const holder = observeConnection(f.db, async () => { atCommit = true; await gate.promise; });
+    const waiter = observeConnection(f.db);
+    const history = async () => (await f.client.query('SELECT name FROM pgmigrations ORDER BY id')).rows;
+    const before = await history();
+    async function act(operation: typeof first | typeof second, db: typeof holder.db) {
+      switch (operation) {
+        case 'cancel': return createRunCancellationRepository(db).tryCancelRun(id);
+        case 'claim': return createRunExecutionLeaseRepository(db).tryClaimRunLease(id, claimArgs);
+        case 'finish': return createAtomicRunFinalizer(db).tryFinalizeWithStep(id, 'completed');
+        case 'reserve': return createRunExecutionProgressRepository(db).tryReserveDecision(id, auth, 0);
+        case 'append': return createRunStepRepository(db).appendRunStep(id, 'completed');
+        case 'downgrade': return migrate('test', 'down', schema);
+      }
+    }
+    const winner = act(first, holder.db);
+    const jobs: Promise<unknown>[] = [winner];
+    void winner.catch(() => {});
+    try {
+      await waitForDb(async () => atCommit);
+      const loser = act(second, waiter.db);
+      void loser.catch(() => {});
+      jobs.push(loser);
+      let blockedPid = 0;
+      await waitForDb(async () => {
+        const { rows } = await f.client.query(`SELECT pid FROM pg_stat_activity
+          WHERE datname=current_database() AND $1::int=ANY(pg_blocking_pids(pid))
+          AND ($2::int IS NULL OR pid=$2)`, [holder.pid(), second === 'downgrade' ? null : waiter.pid()]);
+        blockedPid = rows[0]?.pid;
+        return Boolean(blockedPid);
+      });
+      expect(blockedPid).not.toBe(holder.pid());
+      gate.open();
+      expect(await winner).not.toBeNull();
+      if (second === 'downgrade') await expect(loser).rejects.toThrow('Cannot remove recorded Run cancellation');
+      else if (first === 'claim' || first === 'reserve') expect(await loser).toEqual({ kind: 'cancelled', runId: id, stepNo: 1 });
+      else expect(await loser).toBeNull();
+      expect(holder.releases).toEqual([false]);
+      if (second !== 'downgrade') expect(waiter.releases).toEqual([false]);
+      console.info('C1 parent lock', { first, second, holder: holder.pid(), waiter: blockedPid });
+    } finally { gate.open(); await Promise.allSettled(jobs); }
+    const terminal = first === 'finish' ? 'completed' : 'cancelled';
+    expect(await f.runs.findRunById(id)).toMatchObject({ status: terminal });
+    expect(await steps(f.client, id)).toEqual([{ step_no: 1, result_kind: terminal }]);
+    expect(await history()).toEqual(before);
+    expect((await f.client.query('SELECT 1 FROM run_execution_leases WHERE run_id=$1', [id])).rowCount)
+      .toBe(reservation || first === 'claim' ? 1 : 0);
+    if (reservation) expect(await f.progress.getProgressSnapshot(id)).toMatchObject({
+      decisionsReserved: first === 'reserve' ? 1 : 0, toolAttemptsReserved: 0, lastConfirmedStepNo: null,
+    });
+  }));
+
+it.each(['before claim', 'decision pending', 'handler pending', 'reservation ACK pending'] as const)(
+  'cancels at %s with an actual Worker, Executor and Host grant', async phase => withSchema(async (f, id) => {
+    const scope = { runId: id, toolName: request.toolName, arguments: request.arguments };
+    const policy = createToolAuthorizationPolicy([{ ...scope, effect: 'approval_required' }]);
+    const grant = createToolApprovalGrant(policy, { ...scope, kind: 'pending_authorization' }, 300);
+    const gate = vi.fn(createToolApprovalPermit(policy, grant));
+    const cancel = createRunCancellationRepository(f.db);
+    const proceed = latch();
+    let waiting = false;
+    const pause = async () => { waiting = true; await proceed.promise; };
+    if (phase === 'handler pending') f.handler.mockImplementationOnce(async () => { await pause(); return output; });
+    if (phase === 'decision pending') f.deps.decide.mockReset().mockImplementationOnce(async () => { await pause(); return request; });
+    f.deps.executor.execute.mockImplementation(createInMemoryToolExecutor({
+      registry: createToolRegistry([{ name: 'echo', inputSchema: z.strictObject({ message: z.string() }) }]),
+      handlers: [{ name: 'echo', handle: f.handler }], permitExecution: gate,
+    }).execute);
+    const deps = { ...f.deps, async tryReserveToolAttempt(...args: Parameters<typeof f.deps.tryReserveToolAttempt>) {
+      const result = await f.deps.tryReserveToolAttempt(...args);
+      if (phase === 'reservation ACK pending' && result) await pause();
+      return result;
+    } };
+    if (phase === 'before claim') expect(await cancel.tryCancelRun(id)).not.toBeNull();
+    const job = execute(id, deps, options);
+    void job.catch(() => {});
+    try {
+      if (phase !== 'before claim') {
+        await waitForDb(async () => waiting);
+        const calls = phase === 'handler pending' ? 1 : 0;
+        expect(f.handler).toHaveBeenCalledTimes(calls);
+        expect(gate).toHaveBeenCalledTimes(calls);
+        const snapshot = await f.progress.getProgressSnapshot(id);
+        expect(snapshot).toMatchObject({ decisionsReserved: 1, toolAttemptsReserved: phase === 'decision pending' ? 0 : 1 });
+        expect(await cancel.tryCancelRun(id)).toEqual({ kind: 'cancelled', runId: id, stepNo: 1 });
+        expect(inspectToolApprovalGrant(grant).kind).toBe(calls ? 'consumed' : 'active');
+      }
+    } finally { proceed.open(); await job; }
+    const admitted = phase === 'handler pending' || phase === 'reservation ACK pending';
+    expect(await job).toEqual({ kind: phase === 'before claim' ? 'not_started' :
+      phase === 'decision pending' ? 'tool_admission_conflict' : 'step_persistence_conflict' });
+    expect(await execute(id, deps, options)).toEqual({ kind: 'not_started' });
+    expect(f.deps.decide).toHaveBeenCalledTimes(phase === 'before claim' ? 0 : 1);
+    expect(f.handler).toHaveBeenCalledTimes(admitted ? 1 : 0);
+    expect(gate).toHaveBeenCalledTimes(admitted ? 1 : 0);
+    expect(inspectToolApprovalGrant(grant).kind).toBe(admitted ? 'consumed' : 'active');
+    expect(await f.inspect(id)).toMatchObject({ category: 'terminal_observed', status: 'cancelled',
+      ambiguousToolAttempt: admitted, unconfirmedNonterminalStep: false,
+      progress: phase === 'before claim' ? null : { decisionsReserved: 1, toolAttemptsReserved: admitted ? 1 : 0,
+        checkpointVersion: admitted ? 2 : 1, lastConfirmedStepNo: null } });
+    expect(await steps(f.client, id)).toEqual([{ step_no: 1, result_kind: 'cancelled' }]);
+  }));
+
+it('observes an atomic cancellation pair across snapshots despite a lost COMMIT response', async () => withSchema(async (f, id) => {
+  const lost = Error('Test cancellation acknowledgement lost');
+  const writer = observeConnection(f.db, undefined, () => { throw lost; });
+  await f.client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+  try {
+    const before = await f.inspect(id);
+    expect(before).toMatchObject({ status: 'queued', steps: { count: 0 } });
+    await expect(createRunCancellationRepository(writer.db).tryCancelRun(id)).rejects.toBe(lost);
+    expect(writer.releases).toEqual([true]);
+    expect(await f.inspect(id)).toEqual(before);
+  } finally { await f.client.query('ROLLBACK'); }
+  expect(await f.inspect(id)).toMatchObject({ category: 'terminal_observed', status: 'cancelled', steps: { count: 1, lastKind: 'cancelled' } });
+  expect(await createRunCancellationRepository(f.db).tryCancelRun(id)).toBeNull();
+  expect(await steps(f.client, id)).toEqual([{ step_no: 1, result_kind: 'cancelled' }]);
+}));
+
+it('cancels an expired lease and retains ambiguous attempts and unconfirmed nonterminal history', async () => withSchema(async (f, id) => {
+  const claim = await f.leases.tryClaimRunLease(id, { ownerId: options.ownerId, leaseSeconds: 1 });
+  if (!claim) throw Error('Expected fresh claim');
+  const auth = { ownerId: claim.ownerId, leaseToken: claim.leaseToken };
+  expect(await f.progress.initializeProgress(id, auth, { maxDecisions: 2, maxToolAttempts: 1 })).not.toBeNull();
+  expect(await f.progress.tryReserveDecision(id, auth, 0)).not.toBeNull();
+  expect(await f.progress.tryReserveToolAttempt(id, auth, 1)).not.toBeNull();
+  expect(await f.deps.appendContinuedStepWithLease(id, auth)).not.toBeNull();
+  await waitForDb(async () => (await f.client.query('SELECT clock_timestamp() >= expires_at AS expired FROM run_execution_leases WHERE run_id=$1', [id])).rows[0].expired);
+  expect(await createRunCancellationRepository(f.db).tryCancelRun(id)).toEqual({ kind: 'cancelled', runId: id, stepNo: 2 });
+  expect(await f.inspect(id)).toMatchObject({ category: 'terminal_observed', lease: 'expired', status: 'cancelled',
+    ambiguousToolAttempt: true, unconfirmedNonterminalStep: true, progress: { checkpointVersion: 2, lastConfirmedStepNo: null } });
+  expect(await steps(f.client, id)).toEqual([{ step_no: 1, result_kind: 'continued' }, { step_no: 2, result_kind: 'cancelled' }]);
+}));
+
+it.each(['gap', 'terminal prefix', 'queued steps', 'queued lease', 'queued progress'])(
+  'leaves unsupported %s history intact', async mode => withSchema(async (f, id) => {
+    if (mode.startsWith('queued') && mode !== 'queued steps') {
+      const claim = await f.leases.tryClaimRunLease(id, { ownerId: options.ownerId, leaseSeconds: 30 });
+      if (!claim) throw Error('Expected lease');
+      if (mode === 'queued progress') {
+        await f.progress.initializeProgress(id, { ownerId: claim.ownerId, leaseToken: claim.leaseToken }, { maxDecisions: 1, maxToolAttempts: 0 });
+        await f.client.query('DELETE FROM run_execution_leases WHERE run_id=$1', [id]);
+      }
+      await f.client.query("UPDATE runs SET status='queued' WHERE id=$1", [id]);
+    } else {
+      if (mode !== 'queued steps') await f.runs.tryStartRun(id);
+      await f.client.query('INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,$2,$3)',
+        [id, mode === 'gap' ? 2 : 1, mode === 'terminal prefix' ? 'completed' : 'continued']);
+    }
+    const original = await f.runs.findRunById(id);
+    const oldSteps = await steps(f.client, id);
+    const inspection = await f.inspect(id);
+    expect(await createRunCancellationRepository(f.db).tryCancelRun(id)).toBeNull();
+    expect(await f.runs.findRunById(id)).toEqual(original);
+    expect(await steps(f.client, id)).toEqual(oldSteps);
+    expect(await f.inspect(id)).toEqual(inspection);
+  }));
+
+it('rolls back the Run update and marker when COMMIT has not been sent', async () => withSchema(async (f, id) => {
+  const lost = Error('Test failure before commit');
+  const writer = observeConnection(f.db, async () => { throw lost; });
+  await expect(createRunCancellationRepository(writer.db).tryCancelRun(id)).rejects.toBe(lost);
+  expect(writer.releases).toEqual([true]);
+  expect(await f.runs.findRunById(id)).toMatchObject({ status: 'queued' });
+  expect(await steps(f.client, id)).toEqual([]);
+}));

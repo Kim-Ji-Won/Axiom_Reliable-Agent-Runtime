@@ -44,7 +44,7 @@ async function withSchema(work: (fixture: Fixture) => Promise<void>) {
     } };
     await work({ schema, pool, client, db });
     expect((await client.query('SELECT * FROM run_tool_results')).rowCount).toBe(0);
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(9);
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(10);
     expect(pool.totalCount - pool.idleCount).toBe(1);
   } finally {
     try { if (created) await client!.query(`DROP SCHEMA "${schema}" CASCADE`); }

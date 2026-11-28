@@ -4,7 +4,7 @@
 
 Axiom은 여러 단계로 이루어진 AI 에이전트 작업의 실행 상태와 제어를 관리하기 위한 백엔드 런타임 프로젝트입니다. 모델의 판단과 실제 행동의 실행 권한을 분리하고, 단계적인 개발을 통해 영속적 실행, 도구 검증, 승인 정책, 실행 이력을 갖추는 것을 목표로 합니다.
 
-**현재 단계: P4-B — Trusted Host Approval Grant 로컬 구현·검토 중. P4-A 병합·검증 완료. P3-A~F 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
+**현재 단계: P4-C1 — Durable Host Run Cancellation 로컬 구현·검토 중. P4-A/B 병합·검증 완료. P3-A~F 병합·main 검증 완료. P0-A1~A4, P1-A~G 및 P2-A~F 병합·검증 완료.** PostgreSQL repository를 사용하는 Run 생성·조회 HTTP API와 공유 Zod 계약을 추가했습니다. 내부 `tryStartRun(id)`와 `tryFinishRun(id, outcome)`으로 `queued → running → completed | failed` 전이를 지원합니다. 내부 one-shot 실행과 최대 5회 결정의 bounded loop를 제공하며 자동 실행·실제 모델 호출은 연결하지 않았으며, 외부 읽기는 아래 P2-F의 명시적 내부 구성에서만 허용합니다.
 
 ## Overview · 프로젝트 개요
 
@@ -209,12 +209,12 @@ Docker Desktop과 Docker Compose가 필요합니다. API는 컨테이너화하�
 | --- | --- |
 | `id` | UUID primary key; Node `crypto.randomUUID()`로 생성 |
 | `task` | top-level user task; 원문 유지, 1~4000 Unicode code points, trim 결과가 비어 있으면 거부 |
-| `status` | TEXT, 기본값 `queued`, CHECK로 `queued`, `running`, `completed`, `failed` 허용 |
+| `status` | TEXT, 기본값 `queued`, CHECK로 `queued`, `running`, `completed`, `failed`, `cancelled` 허용 |
 | `created_at` | TIMESTAMPTZ, DB의 `NOW()` 기본값 |
 
 애플리케이션은 잘못된 타입·빈 값·공백 전용 값·길이 초과·NUL·잘못된 Unicode 문자열을 거부합니다. DB는 NOT NULL, 길이, JavaScript trim 공백 집합에 해당하는 nonblank CHECK, status CHECK 및 UUID/PK 제약을 독립적으로 강제합니다. emoji도 PostgreSQL `char_length`와 동일하게 code point 단위로 셉니다. 사용자 입력의 양끝 공백은 저장 전에 제거하지 않습니다.
 
-`createRunRepository(db)`는 `createRun(task): Promise<Run>`, `findRunById(id): Promise<Run | null>`, 내부 연산 `tryStartRun(id): Promise<Run | null>`과 `tryFinishRun(id, outcome): Promise<Run | null>`을 제공합니다. 반환값은 `{ id, task, status: 'queued' | 'running' | 'completed' | 'failed', createdAt: Date }`입니다. 생성은 항상 `queued`이고 호출자가 status를 지정할 수 없습니다. 조회는 네 상태를 모두 지원합니다. 오류는 숨기지 않고 호출자에게 전달하며 DB 오류나 task 내용을 그대로 로그에 남기지 않습니다.
+`createRunRepository(db)`는 `createRun(task): Promise<Run>`, `findRunById(id): Promise<Run | null>`, 내부 연산 `tryStartRun(id): Promise<Run | null>`과 `tryFinishRun(id, outcome): Promise<Run | null>`을 제공합니다. 반환값은 `{ id, task, status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled', createdAt: Date }`입니다. 생성은 항상 `queued`이고 호출자가 status를 지정할 수 없습니다. 조회는 다섯 상태를 모두 지원합니다. 오류는 숨기지 않고 호출자에게 전달하며 DB 오류나 task 내용을 그대로 로그에 남기지 않습니다.
 
 각 생성은 parameterized INSERT 한 문장이므로 DB의 단일 문장 원자성을 사용합니다. `createDatabase(url)`로 만든 pool의 종료 책임은 호출자에게 있습니다. `withDatabase(url, work)`는 성공·실패 모두 `finally`에서 pool을 종료합니다. HTTP 앱은 DB 설정이 있으면 pool 하나를 소유하고 요청 간 재사용하며 `app.close()`에서 종료합니다. 연결은 요청 시 시작하므로 DB가 꺼져도 `/health`는 정상 동작합니다.
 
@@ -705,7 +705,7 @@ Host는 `createToolAuthorizationPolicy(rules?)`로 최대 32개의 정적 규칙
 
 권한의 출처는 신뢰된 Host 구성입니다. 같은 요청의 독립 실행은 매번 허용될 수 있습니다. 정적 allow는 호출마다 평가합니다. 이 정책은 Lease를 검사하거나 외부 효과의 Exactly-Once를 보장하지 않습니다.
 
-## Trusted Host Approval Grant · P4-B 로컬 검토 중
+## Trusted Host Approval Grant · P4-B 완료
 
 신뢰된 Host가 Run UUID와 요청을 알고 있을 때, 현재 정책에서 `approval_required`인 Plan에 `createToolApprovalGrant(policy, plan, ttlSeconds)`로 일회성 허가를 발급합니다. Executor에 `permitExecution: createToolApprovalPermit(policy, grant)`를 명시적으로 연결합니다. 같은 정책 객체, Run, Tool 이름, 인자 snapshot이 일치해야 합니다. 이 경로에서 정적 allow로 대체하거나 다른 Grant를 찾지 않습니다.
 
@@ -714,6 +714,14 @@ TTL은 정수 1~300초이며 프로세스의 monotonic clock으로 측정합니�
 한 JS isolate에서 같은 Grant는 Handler 호출 전에 동기적으로 한 번만 소비됩니다. 같은 범위에 별도로 발급한 Grant는 각각 사용할 수 있습니다. 예약 ACK나 Preflight를 통과하지 못하면 소비하지 않습니다. 소비 후에는 Handler 미등록·실패, 저장 충돌, COMMIT 응답 유실에도 환불·자동 재실행이 없습니다. 소비 상태만으로 Handler의 실행이나 외부 효과를 증명할 수 없습니다. 이미 시작한 Handler의 취소도 지원하지 않습니다.
 
 Grant는 메모리에만 존재합니다. Terminal 상태에서는 private entry에서 정책·인자·시각을 제거하지만 adapter가 캡처한 참조는 남을 수 있으며 메모리 소거와 GC 완료는 보장하지 않습니다. 사용자 인증·동의 증명, DB 저장, 프로세스 간 공유·원자적 소비, 재시작 복원, 승인 대기·재개 및 외부 실행의 Exactly-Once는 지원 범위 밖입니다.
+
+## Durable Host Run Cancellation · P4-C1 로컬 검토 중
+
+신뢰된 Host는 내부 `tryCancelRun(runId)`로 queued 또는 running Run을 취소합니다. UUID는 식별자이며 사용자 인증·동의는 Host의 책임입니다. Parent Run 잠금을 먼저 얻은 terminal writer가 승리합니다. 취소는 상태 변경과 마지막 `cancelled` Step 한 건을 같은 PostgreSQL 트랜잭션에서 커밋합니다. 성공 응답은 COMMIT ACK 뒤에 반환합니다. ACK가 유실되면 결과가 이미 저장됐을 수 있으며 자동 재시도하지 않습니다. 미존재·이미 종료·지원하지 않는 이력에는 `null`을 반환합니다.
+
+기존 Lease, Progress, 예산 예약, watermark, Step 및 저장된 Tool Result는 보존됩니다. Grant를 철회하거나 소비된 예약을 환불·재실행하지 않습니다. Recovery Inspector는 일관된 취소 이력을 `terminal_observed`로 분류하고 미확인 Step과 Tool 시도의 모호성도 계속 표시합니다. Migration #10은 Run 또는 Step 중 한쪽에라도 취소 데이터가 있으면 downgrade를 거부합니다.
+
+기존 GET의 네 필드는 그대로이며 status enum에 `cancelled`가 추가됩니다. 상태를 빠짐없이 분기하는 클라이언트는 이 값을 처리해야 합니다. 공개 취소 route는 없습니다. 취소는 논리적 종료입니다. Tool 예약이 이미 COMMIT된 뒤 ACK 전달 전에 취소되면 나중에 Handler에 진입할 수 있고, 진행 중인 Decision·Handler도 계속 실행될 수 있습니다. 이후 정상 Step·checkpoint·finalization 쓰기는 차단됩니다. 직접 Executor 호출의 전역 차단, 프로세스 간 외부 실행 차단, 외부 효과의 Exactly-Once 및 rollback은 보장하지 않습니다.
 
 ## Run HTTP API · 생성과 조회
 
@@ -755,7 +763,7 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 
 ## Roadmap · 개발 계획
 
-아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A~F는 병합·검증 완료됐고 P4-A는 병합 완료, P4-B는 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
+아래는 단계별 개발 방향입니다. P0-A1~A4, P1-A~G 및 P2-A~F는 병합·검증 완료됐으며 P3-A~F는 병합·검증 완료됐고 P4-A/B는 병합 완료, P4-C1은 로컬 구현·검토 단계입니다. 또한, 요구사항과 검증 결과에 따라 세부 범위가 조정될 수 있습니다.
 
 | 단계 | 목표 | 상태 |
 | --- | --- | --- |
@@ -763,7 +771,7 @@ health 테스트는 `app.inject()`를 사용하며 실제 TCP 포트를 열지 �
 | P1 — Core Runtime | 실행 상태 머신, 모델 결정 계약, 실행 루프와 단계 기록 | P1-A~G 완료; 추가 실행 기능은 후속 범위 |
 | P2 — Tool System | 도구 등록, 입력 검증, 실행 결과 저장, 첫 외부 연동 | P2-A~F 병합·main 검증 완료 |
 | P3 — Durable Execution | 체크포인트, 재시도, 워커, 복구와 멱등성 | P3-A~F 완료 |
-| P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | P4-A 완료 · P4-B 로컬 검토 중 |
+| P4 — Safety & Governance | 사용자 승인, 권한, 취소와 실행 예산 | P4-A/B 완료 · P4-C1 로컬 검토 중 |
 | P5 — Observability | 실행 타임라인, 메트릭, 트레이싱 | 예정 |
 | P6 — Production Runtime | 다중 모델, 분산 실행, 동시성 제어와 테넌트 격리 | 예정 |
 

@@ -7,7 +7,7 @@ export const appendRunStepResultKinds = [
   'decision_source_error', 'finalize_conflict',
 ] as const;
 export const runStepResultKinds = [...appendRunStepResultKinds, 'continued', 'decision_limit_exceeded',
-  'tool_succeeded', 'tool_failed', 'tool_request_rejected', 'tool_execution_limit_exceeded'] as const;
+  'tool_succeeded', 'tool_failed', 'tool_request_rejected', 'tool_execution_limit_exceeded', 'cancelled'] as const;
 export type AppendRunStepResultKind = typeof appendRunStepResultKinds[number];
 export type RunStepResultKind = typeof runStepResultKinds[number];
 
@@ -53,7 +53,7 @@ export function createRunStepRepository(db: StepDatabase) {
       try {
         // A new statement snapshot after the parent lock observes the previous append.
         await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-        const parent = await client.query('SELECT id FROM runs WHERE id = $1 FOR UPDATE', [runId]);
+        const parent = await client.query("SELECT id FROM runs WHERE id = $1 AND status <> 'cancelled' FOR UPDATE", [runId]);
         if (parent.rowCount === 0 || await hasRunLease(client, runId)) {
           committing = true;
           await client.query('COMMIT');

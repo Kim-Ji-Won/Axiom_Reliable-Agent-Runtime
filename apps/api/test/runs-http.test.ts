@@ -26,7 +26,8 @@ it('creates and reads the same four-field contract preserving raw task', async (
 });
 
 it.each([{}, { task: '' }, { task: ' \n\t' }, { task: 1 }, { task: null },
-  { task: 'ok', id }, { task: 'ok', status: 'queued' }, { task: 'ok', status: 'running' }, { task: 'ok', status: 'completed' }, { task: 'ok', status: 'failed' }, { task: 'ok', extra: true },
+  { task: 'ok', id }, { task: 'ok', status: 'queued' }, { task: 'ok', status: 'running' }, { task: 'ok', status: 'completed' }, { task: 'ok', status: 'failed' }, { task: 'ok', status: 'cancelled' },
+  { task: 'ok', cancel: true }, { task: 'ok', approved: true }, { task: 'ok', extra: true },
   { task: 'a'.repeat(4001) }, { task: '😀'.repeat(4001) }, { task: 'x\0y' },
   { task: '\ud800' }, { task: '\udc00' }, [], null])('rejects invalid body case %# before calling repository', async payload => {
   const { app, repository } = setup();
@@ -149,10 +150,16 @@ it.each([
   expect.soft(repository.findRunById).not.toHaveBeenCalled();
 });
 
-it.each(['running', 'completed', 'failed'])('returns %s through the existing GET contract', async status => {
+it.each(['running', 'completed', 'failed', 'cancelled'])('returns %s through the existing GET contract', async status => {
   const { app, repository } = setup();
   repository.findRunById.mockResolvedValue({ ...run, status });
   const response = await app.inject(`/runs/${id}`);
   expect(response.statusCode).toBe(200);
   expect(response.json()).toEqual({ ...expected, status });
+});
+
+it('does not expose the Host cancellation operation over HTTP', async () => {
+  const { app, repository } = setup();
+  expect((await app.inject({ method: 'POST', url: `/runs/${id}/cancel` })).statusCode).toBe(404);
+  for (const spy of Object.values(repository)) expect(spy).not.toHaveBeenCalled();
 });

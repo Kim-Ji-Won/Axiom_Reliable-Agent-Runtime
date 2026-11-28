@@ -71,3 +71,17 @@ it('never turns corrupt projections into categories or leaks private errors', as
     expect(log).not.toHaveBeenCalled();
   } finally { log.mockRestore(); }
 });
+
+it.each([
+  ['cancelled', 1, 1, 1, 'cancelled', 'terminal_observed'],
+  ['cancelled', 0, null, 0, null, 'legacy_or_inconsistent_manual_review'],
+  ['cancelled', 1, 1, 1, 'completed', 'legacy_or_inconsistent_manual_review'],
+  ['cancelled', 2, 2, 2, 'cancelled', 'legacy_or_inconsistent_manual_review'],
+  ['cancelled', 2, 2, 1, 'continued', 'legacy_or_inconsistent_manual_review'],
+  ['cancelled', 1, 2, 1, 'cancelled', 'legacy_or_inconsistent_manual_review'],
+  ...['queued', 'running', 'completed', 'failed'].map(status =>
+    [status, 1, 1, 1, 'cancelled', 'legacy_or_inconsistent_manual_review'] as const),
+] as const)('classifies %s with count %s/max %s/terminal count %s/last %s', async (status, step_count, max_step_no, terminal_count, last_kind, category) => {
+  expect(await reader([{ ...row, status, step_count, max_step_no, terminal_count, last_kind }]).inspect(id))
+    .toMatchObject({ category, status });
+});
