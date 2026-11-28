@@ -302,17 +302,19 @@ it('one Run blocked on Progress does not block another Run',async()=>withSchema(
 
 describe('Progress migration nine',()=>{
   it('up/up, exact metadata columns, empty down and re-up preserve prior history/data',async()=>withSchema(async f=>{
-    const x=await fresh(f);const before=await snapshot(f.client);expect(before.history).toHaveLength(9);
+    const x=await fresh(f);const before=await snapshot(f.client);expect(before.history).toHaveLength(10);
     const cols=(await f.client.query("SELECT column_name,data_type,is_nullable FROM information_schema.columns WHERE table_schema=$1 AND table_name='run_execution_progress' ORDER BY ordinal_position",[f.schema])).rows;
     expect(cols.map(c=>c.column_name)).toEqual(['run_id','schema_version','checkpoint_version','last_confirmed_step_no','max_decisions','decisions_reserved','max_tool_attempts','tool_attempts_reserved','created_at','updated_at']);
     expect(cols.filter(c=>c.is_nullable==='YES').map(c=>c.column_name)).toEqual(['last_confirmed_step_no']);
     expect((await f.client.query("SELECT confdeltype FROM pg_constraint WHERE conrelid='run_execution_progress'::regclass AND contype='f'")).rows.map(c=>c.confdeltype)).toEqual(['a','a']);
     expect(cols.map(c=>c.data_type)).not.toContain('text');expect(cols.map(c=>c.data_type)).not.toContain('jsonb');
-    expect(await migrate('test','up',f.schema)).toHaveLength(0);expect(await migrate('test','down',f.schema)).toHaveLength(1);
+    expect(await migrate('test','up',f.schema)).toHaveLength(0);
+    await migrate('test','down',f.schema); // cancellation checks (#10)
+    expect(await migrate('test','down',f.schema)).toHaveLength(1);
     expect((await f.client.query("SELECT to_regclass('run_execution_progress') AS p")).rows[0].p).toBeNull();
     expect((await f.client.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(before.history.slice(0,8));
     expect(await createRunRepository(f.client).findRunById(x.run.id)).toEqual({...x.run,status:'running'});
-    expect(await migrate('test','up',f.schema)).toHaveLength(1);const after=await snapshot(f.client);
+    expect(await migrate('test','up',f.schema)).toHaveLength(2);const after=await snapshot(f.client);
     for(const key of ['runs','leases','steps','results','constraints'] as const)expect(after[key]).toEqual(before[key]);
   }));
   it.each(['active','expired','terminal','exhausted'])('nonempty %s down preserves data, constraints and all history',async reason=>withSchema(async f=>{
@@ -320,6 +322,7 @@ describe('Progress migration nine',()=>{
     if(reason==='expired')await expire(f.client,x.run.id);
     if(reason==='terminal')await createAtomicRunFinalizer(f.db).tryFinalizeWithStepWithLease(x.run.id,'completed',x.c);
     if(reason==='exhausted')await write('decision',f.db,x.run.id,x.c);
+    await migrate('test','down',f.schema); // exercise migration #9
     const before=await snapshot(f.client);await expect(migrate('test','down',f.schema)).rejects.toThrow('Cannot drop nonempty run_execution_progress');expect(await snapshot(f.client)).toEqual(before);
   }));
   it.each([
@@ -344,6 +347,7 @@ describe('Progress migration nine',()=>{
     expect(confirmed.runs).toEqual(before.runs);
   }));
   it('in-flight initialized writer commits first; down waits on parent and then refuses',async()=>withSchema(async f=>{
+    await migrate('test','down',f.schema); // exercise migration #9
     const x=await fresh(f);const entered=barrier();const gate=barrier();let holder=0;let down:Promise<unknown>|undefined;
     const writer=write('initialize',wrap(f.db,async(c,s,v)=>{if(s==='COMMIT'){holder=await pid(c);entered.resolve();await bounded(gate.promise);}return c.query(s,v);}),x.run.id,x.c);void writer.catch(()=>{});
     try{await bounded(entered.promise);down=migrate('test','down',f.schema).then(()=>({ok:true}),()=>({ok:false}));
@@ -352,6 +356,7 @@ describe('Progress migration nine',()=>{
     }finally{gate.resolve();await Promise.allSettled([writer,...(down?[down]:[])]);}
   }));
   it('down first holds parent through DROP; waiting writer fails closed on missing table without any partial write',async()=>withSchema(async f=>{
+    await migrate('test','down',f.schema); // exercise migration #9
     // Deterministic direct transaction executes the actual migration down SQL, like the runner's single TX.
     const { createRequire }=await import('node:module');const require=createRequire(import.meta.url);
     const migration=require('../../../../db/migrations/1794960000000-create-run-execution-progress.cjs') as {down(pgm:{sql(s:string):void}):void};

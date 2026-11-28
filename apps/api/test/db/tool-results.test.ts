@@ -1,3 +1,6 @@
+import { createRunCancellationRepository } from '../../src/persistence/run-cancellation-repository.js';
+import { createRunExecutionLeaseRepository } from '../../src/persistence/run-execution-lease-repository.js';
+import { createRunExecutionProgressRepository } from '../../src/persistence/run-execution-progress-repository.js';
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { describe, expect, it, vi } from 'vitest';
@@ -91,10 +94,11 @@ async function bounded<T>(promise:Promise<T>):Promise<T>{let timer:ReturnType<ty
 async function waitLock(client:PoolClient,pid:number){await vi.waitFor(async()=>expect((await client.query("SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock'",[pid])).rowCount).toBe(1),{timeout:3000});}
 
 describe('real PostgreSQL privacy gated tool results',()=>{
-  it('migrates nine up/up/down/down/down/up, preserving all existing Run and Step data',async()=>withSchema(async({schema,client,db})=>{
-    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(9);
+  it('migrates up twice, restores schema six and reapplies, preserving all existing Run and Step data',async()=>withSchema(async({schema,client,db})=>{
+    expect((await client.query('SELECT * FROM pgmigrations')).rowCount).toBe(10);
     const r=await running(client);await createRunToolStepRecorder(db).appendToolSucceededStepIfRunning(r.id);
     const before=await snapshot(client);expect(await migrate('test','up',schema)).toHaveLength(0);
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // empty execution Lease table (#8)
     expect(await migrate('test','down',schema)).toHaveLength(1);
@@ -102,7 +106,7 @@ describe('real PostgreSQL privacy gated tool results',()=>{
     expect((await client.query('SELECT * FROM runs ORDER BY id')).rows).toEqual(before.runs);
     expect((await client.query('SELECT * FROM run_steps ORDER BY run_id,step_no')).rows).toEqual(before.steps);
     expect((await client.query('SELECT * FROM pgmigrations ORDER BY id')).rows).toEqual(before.history.slice(0,6));
-    expect(await migrate('test','up',schema)).toHaveLength(3);
+    expect(await migrate('test','up',schema)).toHaveLength(4);
     const after=await snapshot(client);expect(after.runs).toEqual(before.runs);expect(after.steps).toEqual(before.steps);expect(after.constraints).toEqual(before.constraints);
     expect(after.history.slice(0,6)).toEqual(before.history.slice(0,6));
   }));
@@ -220,13 +224,15 @@ describe('real PostgreSQL privacy gated tool results',()=>{
   }));
   it('nonempty migration down preserves rows, all constraints and migration history',async()=>withSchema(async({schema,client,db})=>{
     const r=await running(client);await append(db,r.id);
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // prepare through current API before downgrading
     const before=await snapshot(client);
-    await expect(migrate('test','down',schema)).rejects.toThrow('Cannot drop nonempty run_tool_results');expect(await snapshot(client)).toEqual(before);expect(await migrate('test','up',schema)).toHaveLength(2); // restore #8 and #9
+    await expect(migrate('test','down',schema)).rejects.toThrow('Cannot drop nonempty run_tool_results');expect(await snapshot(client)).toEqual(before);expect(await migrate('test','up',schema)).toHaveLength(3); // restore #8 through #10
   }));
   it('down waits for concurrent Step/Result transaction and then refuses without deleting either',async()=>withSchema(async({schema,client,db})=>{
     const r=await running(client);
+    await migrate('test', 'down', schema); // cancellation checks (#10)
     await migrate('test', 'down', schema); // empty Progress table (#9)
     await migrate('test', 'down', schema); // current API requires #8; subsequent SQL is historical fixture
     const writer=await db.connect();let pending:Promise<{error?:unknown}>|undefined;
@@ -336,3 +342,104 @@ describe('PostgreSQL original TTL precision boundaries', () => {
     } finally { await client.query('ROLLBACK'); }
   }));
 });
+
+it('round-trips migration ten with schema-nine data, history and exact constraints', async () => withSchema(async ({ client, schema, db }) => {
+  await migrate('test', 'down', schema);
+  const run = await running(client);
+  await append(db, run.id);
+  const before = await snapshot(client);
+  expect(before.history).toHaveLength(9);
+  expect(await migrate('test', 'up', schema)).toHaveLength(1);
+  expect(await migrate('test', 'up', schema)).toHaveLength(0);
+  const after = await snapshot(client);
+  expect(after.history.slice(0, 9)).toEqual(before.history);
+  const unchanged = (rows: typeof before.constraints) =>
+    rows.filter(row => !['runs_status_allowed', 'run_steps_result_kind_check'].includes(row.conname));
+  expect(unchanged(after.constraints)).toEqual(unchanged(before.constraints));
+  expect(await migrate('test', 'down', schema)).toHaveLength(1);
+  expect(await snapshot(client)).toEqual(before);
+  expect(await migrate('test', 'up', schema)).toHaveLength(1);
+  const cancel = createRunCancellationRepository(db);
+  expect(await cancel.tryCancelRun(run.id)).toEqual({ kind: 'cancelled', runId: run.id, stepNo: 2 });
+  expect(await cancel.tryCancelRun(run.id)).toBeNull();
+  const final = await snapshot(client);
+  expect(final.steps[0]).toEqual(before.steps[0]);
+  expect(final.results).toEqual(before.results);
+  expect(final.steps).toHaveLength(2);
+  await checkGet(client, run, 'cancelled');
+  expect(await createRunStepRepository(db).listRunSteps(run.id)).toMatchObject([
+    { stepNo: 1, resultKind: 'tool_succeeded' }, { stepNo: 2, resultKind: 'cancelled' },
+  ]);
+  expect(await store(db).appendToolSucceededStepWithSafeResultIfRunning(run.id, 'summary', raw)).toBeNull();
+  expect(await createRunContinueRecorder(db).appendContinuedStepIfRunning(run.id)).toBeNull();
+  expect(await createRunToolStepRecorder(db).appendToolSucceededStepIfRunning(run.id)).toBeNull();
+  expect(await createRunRepository(client).tryFinishRun(run.id, 'failed')).toBeNull();
+  await client.query("UPDATE run_tool_results SET created_at=statement_timestamp()-interval '2 minutes',expires_at=statement_timestamp()-interval '1 minute'");
+  expect(await store(db).deleteExpiredToolResults()).toBe(1);
+  expect(await snapshot(client)).toMatchObject({ runs: final.runs, steps: final.steps, results: [] });
+}));
+
+it.each(['Run only', 'Step only', 'matched pair'])('refuses migration ten down with cancelled %s', async mode =>
+  withSchema(async ({ schema, client, db }) => {
+    const run = await createRunRepository(client).createRun('test');
+    if (mode === 'Run only') await client.query("UPDATE runs SET status='cancelled' WHERE id=$1", [run.id]);
+    else if (mode === 'Step only') await client.query("INSERT INTO run_steps(run_id,step_no,result_kind) VALUES($1,1,'cancelled')", [run.id]);
+    else expect(await createRunCancellationRepository(db).tryCancelRun(run.id)).not.toBeNull();
+    const before = await snapshot(client);
+    expect(before.history).toHaveLength(10);
+    await expect(migrate('test', 'down', schema)).rejects.toThrow('Cannot remove recorded Run cancellation');
+    expect(await snapshot(client)).toEqual(before);
+  }));
+
+it('retains the lease, progress, prior Steps and safe output while blocking post-cancellation writers', async () =>
+  withSchema(async ({ client, db }) => {
+    const runs = createRunRepository(client);
+    const leases = createRunExecutionLeaseRepository(db);
+    const progress = createRunExecutionProgressRepository(db);
+    const cancel = createRunCancellationRepository(db);
+    const claimOptions = { ownerId: randomUUID(), leaseSeconds: 30 };
+    const budgets = { maxDecisions: 3, maxToolAttempts: 1 };
+    const created = await runs.createRun('host cancellation');
+    const id = created.id;
+    const lease = await leases.tryClaimRunLease(id, claimOptions);
+    if (!lease) throw Error('Expected lease');
+    const auth = { ownerId: lease.ownerId, leaseToken: lease.leaseToken };
+    expect(await progress.initializeProgress(id, auth, budgets)).not.toBeNull();
+    expect(await progress.tryReserveDecision(id, auth, 0)).not.toBeNull();
+    expect(await progress.tryReserveToolAttempt(id, auth, 1)).not.toBeNull();
+    expect(await store(db).appendToolSucceededStepWithSafeResultWithLease(id, 'summary', raw, auth)).toHaveProperty('result.safeResult');
+    const durable = async () => ({
+      leases: (await client.query('SELECT * FROM run_execution_leases WHERE run_id=$1', [id])).rows,
+      progress: (await client.query('SELECT * FROM run_execution_progress WHERE run_id=$1', [id])).rows,
+      results: (await client.query('SELECT * FROM run_tool_results WHERE run_id=$1', [id])).rows,
+    });
+    const before = await durable();
+    const prefix = await createRunStepRepository(db).listRunSteps(id);
+    expect(await cancel.tryCancelRun(id)).toEqual({ kind: 'cancelled', runId: id, stepNo: 2 });
+    expect(await leases.tryRenewRunLease(id, auth)).toBeNull();
+    expect(await leases.tryClaimRunLease(id, claimOptions)).toBeNull();
+    expect(await runs.tryStartRun(id)).toBeNull();
+    expect(await createAtomicRunFinalizer(db).tryFinalizeWithStepWithLease(id, 'completed', auth)).toBeNull();
+    expect(await createRunContinueRecorder(db).appendContinuedStepWithLease(id, auth)).toBeNull();
+    expect(await createRunToolStepRecorder(db).appendToolSucceededStepWithLease(id, auth)).toBeNull();
+    expect(await store(db).appendToolSucceededStepWithSafeResultWithLease(id, 'summary', raw, auth)).toBeNull();
+    expect(await progress.tryReserveDecision(id, auth, 2)).toBeNull();
+    expect(await progress.tryConfirmCommittedStep(id, auth, { expectedVersion: 2, stepNo: 1 })).toBeNull();
+    expect(await durable()).toEqual(before);
+    const history = await createRunStepRepository(db).listRunSteps(id);
+    expect(history?.slice(0, -1)).toEqual(prefix);
+    expect(history?.at(-1)).toMatchObject({ resultKind: 'cancelled', stepNo: 2 });
+    for (const stage of ['initialize', 'reserve tool']) {
+      const next = (await runs.createRun('valid admission fixture')).id;
+      const nextLease = await leases.tryClaimRunLease(next, claimOptions);
+      if (!nextLease) throw Error('Expected lease');
+      const credentials = { ownerId: nextLease.ownerId, leaseToken: nextLease.leaseToken };
+      if (stage === 'reserve tool') {
+        expect(await progress.initializeProgress(next, credentials, budgets)).not.toBeNull();
+        expect(await progress.tryReserveDecision(next, credentials, 0)).not.toBeNull();
+      }
+      expect(await cancel.tryCancelRun(next)).not.toBeNull();
+      if (stage === 'initialize') expect(await progress.initializeProgress(next, credentials, budgets)).toBeNull();
+      else expect(await progress.tryReserveToolAttempt(next, credentials, 1)).toBeNull();
+    }
+  }));

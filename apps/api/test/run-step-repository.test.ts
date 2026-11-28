@@ -20,7 +20,7 @@ describe('Run Step repository boundaries', () => {
     await expect(repo.listRunSteps(id as string)).rejects.toThrow('Invalid Run ID');
     expect(connect).not.toHaveBeenCalled();
   });
-  it.each(['continued', 'decision_limit_exceeded', 'not_started', 'running', '', 'SECRET_SENTINEL', null, {}, 1, undefined])('rejects result kind %# before DB calls', async kind => {
+  it.each(['cancelled', 'continued', 'decision_limit_exceeded', 'not_started', 'running', '', 'SECRET_SENTINEL', null, {}, 1, undefined])('rejects result kind %# before DB calls', async kind => {
     const { repo, connect } = setup();
     const logs = ['log', 'info', 'warn', 'error', 'debug'] as const;
     const spies = logs.map(method => vi.spyOn(console, method));
